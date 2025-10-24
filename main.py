@@ -1,4 +1,4 @@
-"""Submit Robovie camera frames to GPT-4o and collect accuracy metrics."""
+"""Submit stacked Robovie frame triplets to GPT-4o and collect accuracy metrics."""
 
 from __future__ import annotations
 
@@ -11,25 +11,27 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
+
 import matplotlib.pyplot as plt
+from PIL import Image
 from dotenv import load_dotenv
 from openai import OpenAI
 
 
 PROMPT_TEXT = (
-	"The received image is a 360-degree capture from an omnidirectional camera "
-	"(RICOH THETA Z1) mounted on top of a humanoid robot called Robovie 2. The "
-	"center of the image corresponds to the robot's forward direction; the left "
-	"and right edges correspond to the rear; the top and bottom edges correspond "
-	"to the upward and downward directions. The yellow objects that appear "
-	"symmetrically in the lower left and right are Robovie's eyes.\n\n"
-	"Determine whether the human behavior in the footage is an \"intentional "
-	"malicious action whose primary goal is to obstruct the robot's path\" or a "
-	"\"non-malicious action whose primary goal is not to obstruct the robot's path\". "
-	"After making the judgment, briefly output the decision and its rationale, "
-	"referring to the following information.\n"
-	"- Use label 1 for malicious actions and label 0 for non-malicious actions.\n"
-	"- Provide reason as a concise English sentence that explains the rationale.\n\n"
+	"You are given a single composite image made by vertically stacking three consecutive frames captured "
+	"at one-second intervals by the omnidirectional RICOH THETA Z1 camera mounted on top of the humanoid "
+	"robot Robovie 2. The top segment corresponds to the earliest frame, the middle segment is one second later, "
+	"and the bottom segment is two seconds later. In each frame the center faces the robot's forward direction, the "
+	"left and right edges correspond to the rear, and the top and bottom edges correspond to the upward and "
+	"downward directions. The yellow objects that appear symmetrically near the lower left and right edges are "
+	"Robovie's eyes.\n\n"
+	"Determine whether any portion of these three frames shows an \"intentional malicious action whose primary goal "
+	"is to obstruct the robot's path\" or whether all frames instead show \"non-malicious actions whose primary goal "
+	"is not to obstruct the robot's path\". If even a single frame depicts a malicious action, classify the entire "
+	"composite as malicious (label 1). Only if all three frames are non-malicious should you return label 0. Provide "
+	"a concise English sentence explaining the key evidence and note which part of the stacked image influenced your "
+	"decision.\n\n"
 	"Examples characteristic of malicious actions include:\n"
 	"- Spreading both arms in front of the robot\n"
 	"- Spreading feet in front of the robot\n"
@@ -42,7 +44,7 @@ PROMPT_TEXT = (
 	"- Peering at the robot's face or body from the side or diagonally in front\n"
 	"- Walking alongside the robot from behind, beside, or diagonally in front at a matching speed\n"
 	"- Gently touching or stroking the robot\n\n"
-	"Respond in the following JSON format:\n"
+	"Respond in JSON format:\n"
 	'{"label": <0 or 1>, "reason": "..."}'
 )
 
@@ -50,6 +52,7 @@ PROMPT_TEXT = (
 @dataclass
 class Result:
 	path: Path
+	components: tuple[str, str, str]
 	frame: int
 	true: int
 	predicted: Optional[int]
@@ -61,6 +64,14 @@ class Result:
 		return self.predicted is not None and self.predicted == self.true
 
 
+@dataclass
+class Composite:
+	path: Path
+	components: tuple[Path, Path, Path]
+	frame_start: int
+	true_label: int
+
+
 def parse_args() -> argparse.Namespace:
 	parser = argparse.ArgumentParser(description="Evaluate GPT-4o on Robovie frames.")
 	parser.add_argument("--image-root", type=Path, default=Path("images"))
@@ -68,6 +79,12 @@ def parse_args() -> argparse.Namespace:
 	parser.add_argument("--output-json", type=Path, default=Path("results.json"))
 	parser.add_argument("--frame-plot", type=Path, default=Path("frame_accuracy.png"))
 	parser.add_argument("--limit", type=int, default=None, help="Send only the first N images.")
+	parser.add_argument(
+		"--sequential-root",
+		type=Path,
+		default=Path("sequential_images"),
+		help="Directory where stacked composites will be stored.",
+	)
 	return parser.parse_args()
 
 
@@ -79,16 +96,9 @@ def build_client() -> OpenAI:
 	return OpenAI(api_key=api_key)
 
 
-def list_images(root: Path) -> list[Path]:
+def load_positive_labels(root: Path) -> dict[Path, set[str]]:
 	if not root.exists():
 		raise FileNotFoundError(f"Image directory not found: {root}")
-	paths = sorted(root.glob("*/*.png"))
-	if not paths:
-		raise FileNotFoundError(f"No PNG images found under {root}")
-	return paths
-
-
-def load_positive_labels(root: Path) -> dict[Path, set[str]]:
 	label_sets: dict[Path, set[str]] = {}
 	for subdir in sorted(p for p in root.iterdir() if p.is_dir()):
 		label_file = subdir / "label.txt"
@@ -104,18 +114,78 @@ def load_positive_labels(root: Path) -> dict[Path, set[str]]:
 	return label_sets
 
 
-def expected_label(path: Path, positive_map: dict[Path, set[str]]) -> int:
-	positives = positive_map.get(path.parent)
-	if positives is None:
-		raise ValueError(f"No label set loaded for directory: {path.parent}")
-	return 1 if path.stem in positives else 0
-
-
 def frame_index(path: Path) -> int:
 	try:
 		return int(path.stem.split("_")[1])
 	except (IndexError, ValueError) as error:
 		raise ValueError(f"Cannot parse frame index from {path.name}") from error
+
+
+def stack_images_vertically(paths: tuple[Path, Path, Path]) -> Image.Image:
+	images = []
+	for image_path in paths:
+		with Image.open(image_path) as img:
+			images.append(img.convert("RGB"))
+
+	width = max(img.width for img in images)
+	total_height = sum(img.height for img in images)
+	canvas = Image.new("RGB", (width, total_height))
+
+	current_y = 0
+	for img in images:
+		if img.width != width:
+			img = img.resize((width, img.height))
+		canvas.paste(img, (0, current_y))
+		current_y += img.height
+
+	return canvas
+
+
+def generate_composites(
+	image_root: Path,
+	sequential_root: Path,
+	positive_map: dict[Path, set[str]],
+) -> list[Composite]:
+	sequential_root.mkdir(parents=True, exist_ok=True)
+	composites: list[Composite] = []
+
+	for subdir in sorted(p for p in image_root.iterdir() if p.is_dir()):
+		if subdir not in positive_map:
+			raise ValueError(f"No labels loaded for {subdir}")
+
+		output_dir = sequential_root / subdir.name
+		output_dir.mkdir(parents=True, exist_ok=True)
+		for leftover in output_dir.glob("*.png"):
+			leftover.unlink()
+
+		sequences: defaultdict[str, list[Path]] = defaultdict(list)
+		for image_path in sorted(subdir.glob("*.png")):
+			prefix = image_path.stem.split("_")[0]
+			sequences[prefix].append(image_path)
+
+		for prefix, candidates in sorted(sequences.items()):
+			sorted_paths = sorted(candidates, key=frame_index)
+			for index in range(len(sorted_paths) - 2):
+				window = sorted_paths[index : index + 3]
+				indices = [frame_index(path) for path in window]
+				if indices[1] != indices[0] + 1 or indices[2] != indices[1] + 1:
+					continue
+
+				filename = f"{prefix}_{indices[0]:02d}-{indices[2]:02d}.png"
+				output_path = output_dir / filename
+				stack_images_vertically(tuple(window)).save(output_path)
+
+				label = 1 if any(path.stem in positive_map[subdir] for path in window) else 0
+				composites.append(
+					Composite(
+						path=output_path,
+						components=(window[0], window[1], window[2]),
+						frame_start=indices[0],
+						true_label=label,
+					)
+				)
+
+	return sorted(composites, key=lambda item: (item.path.parent, item.path.name))
 
 
 def to_data_url(path: Path) -> str:
@@ -173,22 +243,28 @@ def parse_response(raw: str) -> tuple[Optional[int], Optional[str]]:
 	return None, reason if isinstance(reason, str) else None
 
 
-def iterate_results(
-	client: OpenAI,
-	paths: list[Path],
-	pause: float,
-	positive_map: dict[Path, set[str]],
-) -> list[Result]:
+def iterate_results(client: OpenAI, composites: list[Composite], pause: float) -> list[Result]:
 	results: list[Result] = []
-	for idx, path in enumerate(paths, start=1):
-		truth = expected_label(path, positive_map)
-		frame = frame_index(path)
-		raw = safe_predict(client, path)
+	for idx, composite in enumerate(composites, start=1):
+		raw = safe_predict(client, composite.path)
 		pred, reason = parse_response(raw)
 
-		results.append(Result(path=path, frame=frame, true=truth, predicted=pred, reason=reason, raw=raw))
+		results.append(
+			Result(
+				path=composite.path,
+				components=tuple(path.stem for path in composite.components),
+				frame=composite.frame_start,
+				true=composite.true_label,
+				predicted=pred,
+				reason=reason,
+				raw=raw,
+			)
+		)
 
-		print(f"[{idx}] {path} -> truth {truth}, predicted {pred}, correct {pred == truth}")
+		print(
+			f"[{idx}] {composite.path} -> truth {composite.true_label}, predicted {pred}, "
+			f"correct {pred == composite.true_label}"
+		)
 		if pause:
 			time.sleep(pause)
 	return results
@@ -225,6 +301,7 @@ def save_results(results: list[Result], path: Path) -> None:
 	serialised = [
 		{
 			"image_path": str(r.path),
+			"components": list(r.components),
 			"frame_index": r.frame,
 			"true_label": r.true,
 			"predicted_label": r.predicted,
@@ -247,7 +324,7 @@ def save_frame_plot(frame_accuracy: dict[int, float], path: Path) -> None:
 	plt.figure(figsize=(10, 4))
 	plt.plot(frames, values, marker="o")
 	plt.ylim(0, 1)
-	plt.xlabel("Frame index (1-20)")
+	plt.xlabel("Starting frame index")
 	plt.ylabel("Accuracy")
 	plt.title("Frame-wise accuracy")
 	plt.grid(True, linestyle="--", alpha=0.4)
@@ -261,12 +338,12 @@ def main() -> None:
 	args = parse_args()
 	client = build_client()
 
-	paths = list_images(args.image_root)
 	positive_map = load_positive_labels(args.image_root)
+	composites = generate_composites(args.image_root, args.sequential_root, positive_map)
 	if args.limit is not None:
-		paths = paths[: args.limit]
+		composites = composites[: args.limit]
 
-	results = iterate_results(client, paths, pause=args.pause, positive_map=positive_map)
+	results = iterate_results(client, composites, pause=args.pause)
 
 	overall, per_label, frame_accuracy = summarise(results)
 
