@@ -88,10 +88,27 @@ def list_images(root: Path) -> list[Path]:
 	return paths
 
 
-def expected_label(path: Path) -> int:
-	if not path.name[0].isdigit():
-		raise ValueError(f"Cannot infer label from file name: {path.name}")
-	return 1 if int(path.name[0]) % 2 == 0 else 0
+def load_positive_labels(root: Path) -> dict[Path, set[str]]:
+	label_sets: dict[Path, set[str]] = {}
+	for subdir in sorted(p for p in root.iterdir() if p.is_dir()):
+		label_file = subdir / "label.txt"
+		if label_file.exists():
+			entries = {
+				line.strip()
+				for line in label_file.read_text(encoding="utf-8").splitlines()
+				if line.strip()
+			}
+		else:
+			entries = set()
+		label_sets[subdir] = entries
+	return label_sets
+
+
+def expected_label(path: Path, positive_map: dict[Path, set[str]]) -> int:
+	positives = positive_map.get(path.parent)
+	if positives is None:
+		raise ValueError(f"No label set loaded for directory: {path.parent}")
+	return 1 if path.stem in positives else 0
 
 
 def frame_index(path: Path) -> int:
@@ -156,10 +173,15 @@ def parse_response(raw: str) -> tuple[Optional[int], Optional[str]]:
 	return None, reason if isinstance(reason, str) else None
 
 
-def iterate_results(client: OpenAI, paths: list[Path], pause: float) -> list[Result]:
+def iterate_results(
+	client: OpenAI,
+	paths: list[Path],
+	pause: float,
+	positive_map: dict[Path, set[str]],
+) -> list[Result]:
 	results: list[Result] = []
 	for idx, path in enumerate(paths, start=1):
-		truth = expected_label(path)
+		truth = expected_label(path, positive_map)
 		frame = frame_index(path)
 		raw = safe_predict(client, path)
 		pred, reason = parse_response(raw)
@@ -240,10 +262,11 @@ def main() -> None:
 	client = build_client()
 
 	paths = list_images(args.image_root)
+	positive_map = load_positive_labels(args.image_root)
 	if args.limit is not None:
 		paths = paths[: args.limit]
 
-	results = iterate_results(client, paths, pause=args.pause)
+	results = iterate_results(client, paths, pause=args.pause, positive_map=positive_map)
 
 	overall, per_label, frame_accuracy = summarise(results)
 
