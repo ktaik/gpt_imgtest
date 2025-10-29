@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import math
 import os
 import time
 from collections import Counter, defaultdict
@@ -194,10 +195,10 @@ def iterate_results(
 	return results
 
 
-def summarise(results: list[Result]) -> tuple[float, dict[int, float], dict[int, float]]:
+def summarise(results: list[Result]) -> tuple[float, dict[int, float], dict[int, float], dict[int, dict[int, float]]]:
 	total = len(results)
 	if total == 0:
-		return 0.0, {}, {}
+		return 0.0, {}, {}, {}
 
 	correct_total = sum(r.correct for r in results)
 
@@ -205,8 +206,13 @@ def summarise(results: list[Result]) -> tuple[float, dict[int, float], dict[int,
 	per_label_correct: Counter[int] = Counter(r.true for r in results if r.correct)
 
 	per_frame_flags: defaultdict[int, list[bool]] = defaultdict(list)
+	per_frame_label_totals: defaultdict[int, Counter[int]] = defaultdict(Counter)
+	per_frame_label_correct: defaultdict[int, Counter[int]] = defaultdict(Counter)
 	for result in results:
 		per_frame_flags[result.frame].append(result.correct)
+		per_frame_label_totals[result.frame][result.true] += 1
+		if result.correct:
+			per_frame_label_correct[result.frame][result.true] += 1
 
 	per_label_accuracy = {
 		label: per_label_correct[label] / count if count else 0.0
@@ -218,7 +224,16 @@ def summarise(results: list[Result]) -> tuple[float, dict[int, float], dict[int,
 		for frame, flags in sorted(per_frame_flags.items())
 	}
 
-	return correct_total / total, per_label_accuracy, frame_accuracy
+	frame_label_accuracy: dict[int, dict[int, float]] = {}
+	for frame in sorted(per_frame_label_totals.keys()):
+		label_totals = per_frame_label_totals[frame]
+		label_correct = per_frame_label_correct[frame]
+		frame_label_accuracy[frame] = {
+			label: (label_correct[label] / total if total else 0.0)
+			for label, total in label_totals.items()
+		}
+
+	return correct_total / total, per_label_accuracy, frame_accuracy, frame_label_accuracy
 
 
 def save_results(results: list[Result], path: Path) -> None:
@@ -237,21 +252,33 @@ def save_results(results: list[Result], path: Path) -> None:
 	path.write_text(json.dumps(serialised, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def save_frame_plot(frame_accuracy: dict[int, float], path: Path) -> None:
+def save_frame_plot(
+	frame_accuracy: dict[int, float],
+	frame_label_accuracy: dict[int, dict[int, float]],
+	path: Path,
+) -> None:
 	if not frame_accuracy:
 		return
 
-	frames = list(frame_accuracy.keys())
+	frames = sorted(frame_accuracy.keys())
 	values = [frame_accuracy[f] for f in frames]
 
 	plt.figure(figsize=(10, 4))
-	plt.plot(frames, values, marker="o")
+	plt.plot(frames, values, marker="o", label="Overall")
+	label_ids = sorted({label for data in frame_label_accuracy.values() for label in data})
+	for label in label_ids:
+		label_values = [
+			frame_label_accuracy.get(frame, {}).get(label, math.nan)
+			for frame in frames
+		]
+		plt.plot(frames, label_values, marker="o", label=f"Label {label}")
 	plt.ylim(0, 1)
-	plt.xlabel("Frame index (1-20)")
+	plt.xlabel("Frame index")
 	plt.ylabel("Accuracy")
 	plt.title("Frame-wise accuracy")
 	plt.grid(True, linestyle="--", alpha=0.4)
 	plt.xticks(frames)
+	plt.legend()
 	plt.tight_layout()
 	plt.savefig(path, dpi=200)
 	plt.close()
@@ -268,7 +295,7 @@ def main() -> None:
 
 	results = iterate_results(client, paths, pause=args.pause, positive_map=positive_map)
 
-	overall, per_label, frame_accuracy = summarise(results)
+	overall, per_label, frame_accuracy, frame_label_accuracy = summarise(results)
 
 	print("\n=== Accuracy summary ===")
 	print(f"Overall: {overall:.3%} ({sum(r.correct for r in results)}/{len(results)})")
@@ -276,11 +303,15 @@ def main() -> None:
 		print(f"Label {label}: {per_label[label]:.3%}")
 
 	print("\nFrame accuracy:")
-	for frame, accuracy in frame_accuracy.items():
+	for frame in sorted(frame_accuracy):
+		accuracy = frame_accuracy[frame]
 		print(f"Frame {frame:02d}: {accuracy:.3%}")
+		label_breakdown = frame_label_accuracy.get(frame, {})
+		for label in sorted(label_breakdown):
+			print(f"  Label {label}: {label_breakdown[label]:.3%}")
 
 	save_results(results, args.output_json)
-	save_frame_plot(frame_accuracy, args.frame_plot)
+	save_frame_plot(frame_accuracy, frame_label_accuracy, args.frame_plot)
 
 	print(f"\nSaved details to {args.output_json}")
 	print(f"Saved frame plot to {args.frame_plot}")
