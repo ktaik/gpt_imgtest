@@ -209,3 +209,5 @@ __marimo__/
 images/
 frame_accuracy.png
 results.json
+plots/
+sequential_images/
