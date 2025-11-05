@@ -13,6 +13,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+import statistics
+
 import matplotlib.pyplot as plt
 from PIL import Image
 from dotenv import load_dotenv
@@ -64,6 +66,7 @@ class Result:
 	predicted: Optional[int]
 	reason: Optional[str]
 	raw: str
+	latency: float
 
 	@property
 	def correct(self) -> bool:
@@ -82,6 +85,12 @@ def parse_args() -> argparse.Namespace:
 	parser.add_argument("--pause", type=float, default=0.0, help="Sleep seconds between requests.")
 	parser.add_argument("--output-json", type=Path, default=Path("results.json"))
 	parser.add_argument("--frame-plot", type=Path, default=Path("frame_accuracy.png"))
+	parser.add_argument(
+		"--latency-plot",
+		type=Path,
+		default=Path("response_times.png"),
+		help="Line plot of per-request response times.",
+	)
 	parser.add_argument("--limit", type=int, default=None, help="Send only the first N images.")
 	return parser.parse_args()
 
@@ -155,11 +164,14 @@ def call_gpt(client: OpenAI, image_path: Path) -> str:
 	return response.output_text.strip()
 
 
-def safe_predict(client: OpenAI, image_path: Path, retries: int = 4) -> str:
+def safe_predict(client: OpenAI, image_path: Path, retries: int = 4) -> tuple[str, float]:
 	delay = 2.0
+	start = time.perf_counter()
 	for attempt in range(1, retries + 1):
 		try:
-			return call_gpt(client, image_path)
+			response = call_gpt(client, image_path)
+			elapsed = time.perf_counter() - start
+			return response, elapsed
 		except Exception as error:  # noqa: BLE001
 			if attempt == retries:
 				raise RuntimeError(f"Failed to call GPT for {image_path}") from error
@@ -191,12 +203,17 @@ def iterate_results(client: OpenAI, paths: list[Path], pause: float) -> list[Res
 	for idx, path in enumerate(paths, start=1):
 		truth = expected_label(path)
 		frame = frame_index(path)
-		raw = safe_predict(client, path)
+		raw, latency = safe_predict(client, path)
 		pred, reason = parse_response(raw)
 
-		results.append(Result(path=path, frame=frame, true=truth, predicted=pred, reason=reason, raw=raw))
+		results.append(
+			Result(path=path, frame=frame, true=truth, predicted=pred, reason=reason, raw=raw, latency=latency)
+		)
 
-		print(f"[{idx}] {path} -> truth {truth}, predicted {pred}, correct {pred == truth}")
+		print(
+			f"[{idx}] {path} -> truth {truth}, predicted {pred}, correct {pred == truth}, "
+			f"latency {latency:.2f}s"
+		)
 		if pause:
 			time.sleep(pause)
 	return results
@@ -255,6 +272,7 @@ def save_results(results: list[Result], path: Path) -> None:
 			"reason": r.reason,
 			"raw_response": r.raw,
 			"correct": r.correct,
+			"response_time_seconds": r.latency,
 		}
 		for r in results
 	]
@@ -344,6 +362,22 @@ def save_label_heatmaps(results: list[Result], output_dir: Path) -> list[Path]:
 	return saved_paths
 
 
+def save_latency_plot(latencies: list[float], path: Path) -> None:
+	if not latencies:
+		return
+	path.parent.mkdir(parents=True, exist_ok=True)
+	indices = list(range(1, len(latencies) + 1))
+	plt.figure(figsize=(10, 4))
+	plt.plot(indices, latencies, marker="o")
+	plt.xlabel("Request index")
+	plt.ylabel("Response time (s)")
+	plt.title("OpenAI response times")
+	plt.grid(True, linestyle="--", alpha=0.4)
+	plt.tight_layout()
+	plt.savefig(path, dpi=200)
+	plt.close()
+
+
 def main() -> None:
 	args = parse_args()
 	ensure_trimmed_images(args.image_root, args.trimmed_root)
@@ -370,12 +404,24 @@ def main() -> None:
 		for label in sorted(label_breakdown):
 			print(f"  Label {label}: {label_breakdown[label]:.3%}")
 
+	latencies = [result.latency for result in results]
+	if latencies:
+		average_latency = statistics.mean(latencies)
+		print(f"\nAverage response time: {average_latency:.2f}s over {len(latencies)} requests")
+	else:
+		print("\nAverage response time: n/a (no results)")
+
 	save_results(results, args.output_json)
 	save_frame_plot(frame_accuracy, frame_label_accuracy, args.frame_plot)
+	save_latency_plot(latencies, args.latency_plot)
 	heatmap_paths = save_label_heatmaps(results, HEATMAP_DIR)
 
 	print(f"\nSaved details to {args.output_json}")
 	print(f"Saved frame plot to {args.frame_plot}")
+	if latencies:
+		print(f"Saved latency plot to {args.latency_plot}")
+	else:
+		print("Latency plot not generated (no results).")
 	if heatmap_paths:
 		for path in heatmap_paths:
 			print(f"Saved label heatmap to {path}")
