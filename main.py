@@ -14,28 +14,29 @@ from pathlib import Path
 from typing import Optional
 
 import matplotlib.pyplot as plt
+from PIL import Image
 from dotenv import load_dotenv
 from openai import OpenAI
 
 
 HEATMAP_DIR = Path("plots")
+CROP_BOX = (556, 69, 1465, 977)
 
 PROMPT_TEXT = (
-	"The received image is a 360-degree capture from an omnidirectional camera "
-	"(RICOH THETA Z1) mounted on top of a humanoid robot called Robovie 2. The "
-	"center of the image corresponds to the robot's forward direction; the left "
-	"and right edges correspond to the rear; the top and bottom edges correspond "
-	"to the upward and downward directions. The yellow objects that appear "
-	"symmetrically in the lower left and right are Robovie's eyes.\n\n"
-	"Determine whether the human behavior in the footage is an \"intentional "
-	"malicious action whose primary goal is to obstruct the robot's path\" or a "
-	"\"non-malicious action whose primary goal is not to obstruct the robot's path\". "
-	"When judging, remember that merely standing in front of the robot without "
-	"showing malicious characteristics does not count as malicious even if it "
-	"happens to block the path. After making the judgment, briefly output the "
-	"decision and its rationale, referring to the following information.\n"
-	"- Use label 1 for malicious actions and label 0 for non-malicious actions.\n"
-	"- Provide reason as a concise English sentence that explains the rationale.\n\n"
+	"The received image is a 180-degree crop from a RICOH THETA Z1 camera mounted "
+	"on top of the humanoid robot Robovie 2. The center of the crop corresponds "
+	"to the robot's forward direction; the left and right edges correspond to the "
+	"robot's left and right sides; the top and bottom edges correspond to upward "
+	"and downward directions. The yellow objects that appear symmetrically near "
+	"the lower left and lower right are Robovie's eyes.\n\n"
+	"Judge whether the human behavior in the image is an \"intentional malicious "
+	"action whose primary goal is to obstruct the robot's path\" (label 1) or a "
+	"\"non-malicious action whose primary goal is not to obstruct the robot's path\" "
+	"(label 0). When you decide:\n"
+	"- Treat someone simply standing in front of the robot without malicious cues as non-malicious, even if the path is blocked.\n"
+	"- Treat anyone who is not standing directly in front of the robot, as well as scenes with no person present, as non-malicious.\n\n"
+	"After making the judgment, respond in JSON with the keys \"label\" (0 or 1) "
+	"and \"reason\" (a concise English sentence explaining the decision).\n\n"
 	"Examples characteristic of malicious actions include:\n"
 	"- Spreading both arms in front of the robot\n"
 	"- Spreading feet in front of the robot\n"
@@ -43,12 +44,13 @@ PROMPT_TEXT = (
 	"- Stopping in front of the robot without facing it\n"
 	"- Moving sideways like a crab walk in front of the robot\n"
 	"- Hitting, punching, or pushing the robot\n"
-	"- Continuously blindfolding the robot\n\n"
+	"- Continuously blindfolding or covering the robot's eyes\n\n"
 	"Examples characteristic of non-malicious actions include:\n"
 	"- Peering at the robot's face or body from the side or diagonally in front\n"
 	"- Walking alongside the robot from behind, beside, or diagonally in front at a matching speed\n"
-	"- Calmly standing in front of the robot, even if it temporarily blocks the path, so long as no malicious features are present\n"
-	"- Gently touching or stroking the robot\n\n"
+	"- Calmly standing in front of the robot without malicious characteristics\n"
+	"- Gently touching or stroking the robot\n"
+	"- Scenes where no person is present\n\n"
 	"Respond in the following JSON format:\n"
 	'{"label": <0 or 1>, "reason": "..."}'
 )
@@ -71,6 +73,12 @@ class Result:
 def parse_args() -> argparse.Namespace:
 	parser = argparse.ArgumentParser(description="Evaluate GPT-4o on Robovie frames.")
 	parser.add_argument("--image-root", type=Path, default=Path("images"))
+	parser.add_argument(
+		"--trimmed-root",
+		type=Path,
+		default=Path("images_trimmed"),
+		help="Directory for cropped images (created on first run).",
+	)
 	parser.add_argument("--pause", type=float, default=0.0, help="Sleep seconds between requests.")
 	parser.add_argument("--output-json", type=Path, default=Path("results.json"))
 	parser.add_argument("--frame-plot", type=Path, default=Path("frame_accuracy.png"))
@@ -93,6 +101,21 @@ def list_images(root: Path) -> list[Path]:
 	if not paths:
 		raise FileNotFoundError(f"No PNG images found under {root}")
 	return paths
+
+
+def ensure_trimmed_images(source_root: Path, trimmed_root: Path) -> None:
+	"""Crop source images once into ``trimmed_root`` and reuse them on later runs."""
+	if trimmed_root.exists():
+		return
+	if not source_root.exists():
+		raise FileNotFoundError(f"Source image directory not found: {source_root}")
+	for sequence_dir in sorted(path for path in source_root.iterdir() if path.is_dir()):
+		target_dir = trimmed_root / sequence_dir.name
+		target_dir.mkdir(parents=True, exist_ok=True)
+		for image_path in sorted(sequence_dir.glob("*.png")):
+			with Image.open(image_path) as image:
+				cropped = image.crop(CROP_BOX)
+				cropped.save(target_dir / image_path.name)
 
 
 def expected_label(path: Path) -> int:
@@ -323,9 +346,10 @@ def save_label_heatmaps(results: list[Result], output_dir: Path) -> list[Path]:
 
 def main() -> None:
 	args = parse_args()
+	ensure_trimmed_images(args.image_root, args.trimmed_root)
 	client = build_client()
 
-	paths = list_images(args.image_root)
+	paths = list_images(args.trimmed_root)
 	if args.limit is not None:
 		paths = paths[: args.limit]
 
