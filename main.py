@@ -23,38 +23,23 @@ from openai import OpenAI
 
 HEATMAP_DIR = Path("plots")
 CROP_BOX = (556, 69, 1465, 977)
+QUARTER_SCALE = 0.25
 
 PROMPT_TEXT = (
 	"The received image is a 180-degree crop from a RICOH THETA Z1 camera mounted "
-	"on top of the humanoid robot Robovie 2. The center of the crop corresponds "
-	"to the robot's forward direction; the left and right edges correspond to the "
-	"robot's left and right sides; the top and bottom edges correspond to upward "
-	"and downward directions. The yellow objects that appear symmetrically near "
-	"the lower left and lower right are Robovie's eyes.\n\n"
-	"Judge whether the human behavior in the image is an \"intentional malicious "
-	"action whose primary goal is to obstruct the robot's path\" (label 1) or a "
-	"\"non-malicious action whose primary goal is not to obstruct the robot's path\" "
-	"(label 0). When you decide:\n"
-	"- Treat someone simply standing in front of the robot without malicious cues as non-malicious, even if the path is blocked.\n"
-	"- Treat anyone who is not standing directly in front of the robot, as well as scenes with no person present, as non-malicious.\n\n"
-	"After making the judgment, respond in JSON with the keys \"label\" (0 or 1) "
-	"and \"reason\" (a concise English sentence explaining the decision).\n\n"
-	"Examples characteristic of malicious actions include:\n"
-	"- Spreading both arms in front of the robot\n"
-	"- Spreading feet in front of the robot\n"
-	"- Extending a foot in front of the robot\n"
-	"- Stopping in front of the robot without facing it\n"
-	"- Moving sideways like a crab walk in front of the robot\n"
-	"- Hitting, punching, or pushing the robot\n"
-	"- Continuously blindfolding or covering the robot's eyes\n\n"
-	"Examples characteristic of non-malicious actions include:\n"
-	"- Peering at the robot's face or body from the side or diagonally in front\n"
-	"- Walking alongside the robot from behind, beside, or diagonally in front at a matching speed\n"
-	"- Calmly standing in front of the robot without malicious characteristics\n"
-	"- Gently touching or stroking the robot\n"
-	"- Scenes where no person is present\n\n"
-	"Respond in the following JSON format:\n"
-	'{"label": <0 or 1>, "reason": "..."}'
+	"on the humanoid robot Robovie 2. The center of the crop corresponds to the "
+	"robot's forward direction; the left and right edges correspond to the robot's "
+	"left and right sides; the top and bottom edges correspond to upward and "
+	"downward directions. The yellow objects that appear symmetrically near the "
+	"lower left and lower right are Robovie's eyes.\n\n"
+	"Classify whether the human behavior in the image is an intentional malicious "
+	"action whose primary goal is to obstruct the robot's path (output 1) or a "
+	"non-malicious action whose primary goal is not to obstruct the robot's path "
+	"(output 0). Apply the following rules:\n"
+	"- Someone calmly standing in front of the robot without malicious cues counts as non-malicious (0).\n"
+	"- Anyone not standing directly in front of the robot, or scenes with no person present, count as non-malicious (0).\n"
+	"- Actions such as spreading arms/legs to block, extending a foot to trip, crab-walking, hitting or pushing the robot, or covering its eyes count as malicious (1).\n\n"
+	"Return exactly one character: 1 for malicious or 0 for non-malicious. Do not include explanations or any additional text."
 )
 
 
@@ -64,7 +49,6 @@ class Result:
 	frame: int
 	true: int
 	predicted: Optional[int]
-	reason: Optional[str]
 	raw: str
 	latency: float
 
@@ -127,6 +111,25 @@ def ensure_trimmed_images(source_root: Path, trimmed_root: Path) -> None:
 				cropped.save(target_dir / image_path.name)
 
 
+def ensure_quarter_images(trimmed_root: Path) -> Path:
+	quarter_root = trimmed_root.parent / f"{trimmed_root.name}_quarter"
+	if quarter_root.exists():
+		return quarter_root
+	quarter_root.mkdir(parents=True, exist_ok=True)
+	for sequence_dir in sorted(path for path in trimmed_root.iterdir() if path.is_dir()):
+		target_dir = quarter_root / sequence_dir.name
+		target_dir.mkdir(parents=True, exist_ok=True)
+		for image_path in sorted(sequence_dir.glob("*.png")):
+			with Image.open(image_path) as image:
+				new_size = (
+					max(1, int(round(image.width * QUARTER_SCALE))),
+					max(1, int(round(image.height * QUARTER_SCALE))),
+				)
+				resized = image.resize(new_size, Image.LANCZOS)
+				resized.save(target_dir / image_path.name)
+	return quarter_root
+
+
 def expected_label(path: Path) -> int:
 	if not path.name[0].isdigit():
 		raise ValueError(f"Cannot infer label from file name: {path.name}")
@@ -159,7 +162,7 @@ def call_gpt(client: OpenAI, image_path: Path) -> str:
 				],
 			}
 		],
-		max_output_tokens=200,
+		max_output_tokens=16,
 	)
 	return response.output_text.strip()
 
@@ -180,22 +183,17 @@ def safe_predict(client: OpenAI, image_path: Path, retries: int = 4) -> tuple[st
 			delay *= 2
 
 
-def parse_response(raw: str) -> tuple[Optional[int], Optional[str]]:
-	raw = raw.strip()
-	start, end = raw.find("{"), raw.rfind("}")
-	if start == -1 or end == -1 or start >= end:
-		return None, None
-
-	try:
-		payload = json.loads(raw[start : end + 1])
-	except json.JSONDecodeError:
-		return None, None
-
-	label = payload.get("label")
-	reason = payload.get("reason")
-	if isinstance(label, int) and label in (0, 1):
-		return label, reason if isinstance(reason, str) else None
-	return None, reason if isinstance(reason, str) else None
+def parse_response(raw: str) -> Optional[int]:
+	text = raw.strip()
+	if not text:
+		return None
+	first = text[0]
+	if first in {"0", "1"}:
+		return int(first)
+	for char in text:
+		if char in {"0", "1"}:
+			return int(char)
+	return None
 
 
 def iterate_results(client: OpenAI, paths: list[Path], pause: float) -> list[Result]:
@@ -204,11 +202,9 @@ def iterate_results(client: OpenAI, paths: list[Path], pause: float) -> list[Res
 		truth = expected_label(path)
 		frame = frame_index(path)
 		raw, latency = safe_predict(client, path)
-		pred, reason = parse_response(raw)
+		pred = parse_response(raw)
 
-		results.append(
-			Result(path=path, frame=frame, true=truth, predicted=pred, reason=reason, raw=raw, latency=latency)
-		)
+		results.append(Result(path=path, frame=frame, true=truth, predicted=pred, raw=raw, latency=latency))
 
 		print(
 			f"[{idx}] {path} -> truth {truth}, predicted {pred}, correct {pred == truth}, "
@@ -269,7 +265,6 @@ def save_results(results: list[Result], path: Path) -> None:
 			"frame_index": r.frame,
 			"true_label": r.true,
 			"predicted_label": r.predicted,
-			"reason": r.reason,
 			"raw_response": r.raw,
 			"correct": r.correct,
 			"response_time_seconds": r.latency,
@@ -381,9 +376,10 @@ def save_latency_plot(latencies: list[float], path: Path) -> None:
 def main() -> None:
 	args = parse_args()
 	ensure_trimmed_images(args.image_root, args.trimmed_root)
+	quarter_root = ensure_quarter_images(args.trimmed_root)
 	client = build_client()
 
-	paths = list_images(args.trimmed_root)
+	paths = list_images(quarter_root)
 	if args.limit is not None:
 		paths = paths[: args.limit]
 
