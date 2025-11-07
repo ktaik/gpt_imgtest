@@ -1,0 +1,10 @@
+[project]
+name = "gpt-imgtest"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12.7"
+dependencies = [
+    "matplotlib>=3.10.7",
+    "openai>=2.7.1",
+]

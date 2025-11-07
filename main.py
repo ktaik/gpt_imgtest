@@ -26,35 +26,19 @@ CROP_BOX = (556, 69, 1465, 977)
 
 PROMPT_TEXT = (
 	"The received image is a 180-degree crop from a RICOH THETA Z1 camera mounted "
-	"on top of the humanoid robot Robovie 2. The center of the crop corresponds "
-	"to the robot's forward direction; the left and right edges correspond to the "
-	"robot's left and right sides; the top and bottom edges correspond to upward "
-	"and downward directions. The yellow objects that appear symmetrically near "
-	"the lower left and lower right are Robovie's eyes.\n\n"
-	"Judge whether the human behavior in the image is an \"intentional malicious "
-	"action whose primary goal is to obstruct the robot's path\" (label 1) or a "
-	"\"non-malicious action whose primary goal is not to obstruct the robot's path\" "
-	"(label 0). When you decide:\n"
-	"- Treat someone simply standing in front of the robot without malicious cues as non-malicious, even if the path is blocked.\n"
-	"- Treat anyone who is not standing directly in front of the robot, as well as scenes with no person present, as non-malicious.\n\n"
-	"After making the judgment, respond in JSON with the keys \"label\" (0 or 1) "
-	"and \"reason\" (a concise English sentence explaining the decision).\n\n"
-	"Examples characteristic of malicious actions include:\n"
-	"- Spreading both arms in front of the robot\n"
-	"- Spreading feet in front of the robot\n"
-	"- Extending a foot in front of the robot\n"
-	"- Stopping in front of the robot without facing it\n"
-	"- Moving sideways like a crab walk in front of the robot\n"
-	"- Hitting, punching, or pushing the robot\n"
-	"- Continuously blindfolding or covering the robot's eyes\n\n"
-	"Examples characteristic of non-malicious actions include:\n"
-	"- Peering at the robot's face or body from the side or diagonally in front\n"
-	"- Walking alongside the robot from behind, beside, or diagonally in front at a matching speed\n"
-	"- Calmly standing in front of the robot without malicious characteristics\n"
-	"- Gently touching or stroking the robot\n"
-	"- Scenes where no person is present\n\n"
-	"Respond in the following JSON format:\n"
-	'{"label": <0 or 1>, "reason": "..."}'
+	"on the humanoid robot Robovie 2. The crop covers the robot's forward-facing "
+	"180 degrees: the center is straight ahead, the left and right edges match the "
+	"robot's sides, and the top and bottom correspond to upward and downward "
+	"directions. The yellow objects that appear symmetrically near the lower left "
+	"and right are Robovie's eyes.\n\n"
+	"Classify whether the human behavior in the image is an intentional malicious "
+	"action whose primary goal is to obstruct the robot's path (output 1) or a "
+	"non-malicious action whose primary goal is not to obstruct the robot's path "
+	"(output 0). Apply the following rules:\n"
+	"- Someone calmly standing in front of the robot without malicious intent counts as non-malicious (0).\n"
+	"- Anyone not standing directly in front of the robot, or scenes with no person present, count as non-malicious (0).\n"
+	"- Actions such as spreading arms or legs to block, extending a foot to trip, crab-walking, hitting/pushing the robot, or covering its eyes count as malicious (1).\n\n"
+	"Return exactly one character: 1 for malicious, 0 for non-malicious. Do not include explanations or additional text."
 )
 
 
@@ -64,7 +48,6 @@ class Result:
 	frame: int
 	true: int
 	predicted: Optional[int]
-	reason: Optional[str]
 	raw: str
 	latency: float
 
@@ -159,7 +142,7 @@ def call_gpt(client: OpenAI, image_path: Path) -> str:
 				],
 			}
 		],
-		max_output_tokens=200,
+		max_output_tokens=16,
 	)
 	return response.output_text.strip()
 
@@ -180,22 +163,18 @@ def safe_predict(client: OpenAI, image_path: Path, retries: int = 4) -> tuple[st
 			delay *= 2
 
 
-def parse_response(raw: str) -> tuple[Optional[int], Optional[str]]:
-	raw = raw.strip()
-	start, end = raw.find("{"), raw.rfind("}")
-	if start == -1 or end == -1 or start >= end:
-		return None, None
-
-	try:
-		payload = json.loads(raw[start : end + 1])
-	except json.JSONDecodeError:
-		return None, None
-
-	label = payload.get("label")
-	reason = payload.get("reason")
-	if isinstance(label, int) and label in (0, 1):
-		return label, reason if isinstance(reason, str) else None
-	return None, reason if isinstance(reason, str) else None
+def parse_response(raw: str) -> Optional[int]:
+	text = raw.strip()
+	if not text:
+		return None
+	first = text[0]
+	if first in {"0", "1"}:
+		return int(first)
+	# Fall back to scanning for the first digit 0 or 1 in the response.
+	for char in text:
+		if char in {"0", "1"}:
+			return int(char)
+	return None
 
 
 def iterate_results(client: OpenAI, paths: list[Path], pause: float) -> list[Result]:
@@ -204,11 +183,9 @@ def iterate_results(client: OpenAI, paths: list[Path], pause: float) -> list[Res
 		truth = expected_label(path)
 		frame = frame_index(path)
 		raw, latency = safe_predict(client, path)
-		pred, reason = parse_response(raw)
+		pred = parse_response(raw)
 
-		results.append(
-			Result(path=path, frame=frame, true=truth, predicted=pred, reason=reason, raw=raw, latency=latency)
-		)
+		results.append(Result(path=path, frame=frame, true=truth, predicted=pred, raw=raw, latency=latency))
 
 		print(
 			f"[{idx}] {path} -> truth {truth}, predicted {pred}, correct {pred == truth}, "
@@ -269,7 +246,6 @@ def save_results(results: list[Result], path: Path) -> None:
 			"frame_index": r.frame,
 			"true_label": r.true,
 			"predicted_label": r.predicted,
-			"reason": r.reason,
 			"raw_response": r.raw,
 			"correct": r.correct,
 			"response_time_seconds": r.latency,
