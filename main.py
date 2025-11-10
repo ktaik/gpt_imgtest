@@ -6,7 +6,6 @@ import argparse
 import base64
 import json
 import math
-import os
 import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass
@@ -17,12 +16,13 @@ import statistics
 
 import matplotlib.pyplot as plt
 from PIL import Image
-from dotenv import load_dotenv
-from openai import OpenAI
+import requests
 
 
 HEATMAP_DIR = Path("plots")
 CROP_BOX = (556, 69, 1465, 977)
+VLM_URL = "http://10.229.40.52:11434/api/generate"
+VLM_MODEL = "qwen3-vl:8b"
 
 PROMPT_TEXT = (
 	"The received image is a 180-degree crop from a RICOH THETA Z1 camera mounted "
@@ -95,12 +95,8 @@ def parse_args() -> argparse.Namespace:
 	return parser.parse_args()
 
 
-def build_client() -> OpenAI:
-	load_dotenv()
-	api_key = os.getenv("OPENAI_API_KEY")
-	if not api_key:
-		raise EnvironmentError("OPENAI_API_KEY is missing. Check your .env file.")
-	return OpenAI(api_key=api_key)
+def build_session() -> requests.Session:
+	return requests.Session()
 
 
 def list_images(root: Path) -> list[Path]:
@@ -140,36 +136,35 @@ def frame_index(path: Path) -> int:
 		raise ValueError(f"Cannot parse frame index from {path.name}") from error
 
 
-def to_data_url(path: Path) -> str:
+def encode_image_base64(path: Path) -> str:
 	with path.open("rb") as handle:
-		payload = base64.b64encode(handle.read()).decode("ascii")
-	return f"data:image/png;base64,{payload}"
+		return base64.b64encode(handle.read()).decode("ascii")
 
 
-def call_gpt(client: OpenAI, image_path: Path) -> str:
-	image_data = to_data_url(image_path)
-	response = client.responses.create(
-		model="gpt-4o",
-		input=[
-			{
-				"role": "user",
-				"content": [
-					{"type": "input_text", "text": PROMPT_TEXT},
-					{"type": "input_image", "image_url": image_data},
-				],
-			}
-		],
-		max_output_tokens=200,
-	)
-	return response.output_text.strip()
+def call_vlm(session: requests.Session, image_path: Path) -> str:
+	image_data = encode_image_base64(image_path)
+	payload = {
+		"model": VLM_MODEL,
+		"prompt": PROMPT_TEXT,
+		"images": [image_data],
+		"stream": False,
+	}
+	response = session.post(VLM_URL, json=payload, timeout=180)
+	response.raise_for_status()
+	data = response.json()
+	text = data.get("response")
+	if not isinstance(text, str):
+		raise ValueError(f"Unexpected response structure: {data}")
+	return text.strip()
 
 
-def safe_predict(client: OpenAI, image_path: Path, retries: int = 4) -> tuple[str, float]:
+
+def safe_predict(session: requests.Session, image_path: Path, retries: int = 4) -> tuple[str, float]:
 	delay = 2.0
-	start = time.perf_counter()
 	for attempt in range(1, retries + 1):
 		try:
-			response = call_gpt(client, image_path)
+			start = time.perf_counter()
+			response = call_vlm(session, image_path)
 			elapsed = time.perf_counter() - start
 			return response, elapsed
 		except Exception as error:  # noqa: BLE001
@@ -198,12 +193,12 @@ def parse_response(raw: str) -> tuple[Optional[int], Optional[str]]:
 	return None, reason if isinstance(reason, str) else None
 
 
-def iterate_results(client: OpenAI, paths: list[Path], pause: float) -> list[Result]:
+def iterate_results(session: requests.Session, paths: list[Path], pause: float) -> list[Result]:
 	results: list[Result] = []
 	for idx, path in enumerate(paths, start=1):
 		truth = expected_label(path)
 		frame = frame_index(path)
-		raw, latency = safe_predict(client, path)
+		raw, latency = safe_predict(session, path)
 		pred, reason = parse_response(raw)
 
 		results.append(
@@ -381,13 +376,13 @@ def save_latency_plot(latencies: list[float], path: Path) -> None:
 def main() -> None:
 	args = parse_args()
 	ensure_trimmed_images(args.image_root, args.trimmed_root)
-	client = build_client()
+	session = build_session()
 
 	paths = list_images(args.trimmed_root)
 	if args.limit is not None:
 		paths = paths[: args.limit]
 
-	results = iterate_results(client, paths, pause=args.pause)
+	results = iterate_results(session, paths, pause=args.pause)
 
 	overall, per_label, frame_accuracy, frame_label_accuracy = summarise(results)
 

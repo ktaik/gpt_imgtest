@@ -213,3 +213,11 @@ plots/
 sequential_images/
 images_trimmed/
 response_times.png
+frame_accuracy_half.png
+frame_accuracy_quarter.png
+images_trimmed_half/
+images_trimmed_quarter/
+response_times_half.png
+response_times_quarter.png
+results_half.json
+results_quarter.json
