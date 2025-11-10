@@ -22,7 +22,7 @@ import requests
 HEATMAP_DIR = Path("plots")
 CROP_BOX = (556, 69, 1465, 977)
 VLM_URL = "http://10.229.40.52:11434/api/generate"
-VLM_MODEL = "qwen3-vl:8b"
+VLM_MODEL = "qwen3-vl:32b"
 
 PROMPT_TEXT = (
 	"The received image is a 180-degree crop from a RICOH THETA Z1 camera mounted "
