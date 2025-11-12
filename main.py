@@ -23,6 +23,15 @@ from openai import OpenAI
 
 HEATMAP_DIR = Path("plots")
 CROP_BOX = (556, 69, 1465, 977)
+SCALE_CONFIGS: list[tuple[float, str, str]] = [
+	(1.0, "orig", ""),
+	(0.5, "half", "_half"),
+	(0.25, "quarter", "_quarter"),
+	(0.125, "eighth", "_eighth"),
+	(0.0625, "sixteenth", "_sixteenth"),
+	(0.03125, "thirtysecond", "_thirtysecond"),
+	(0.015625, "sixtyfourth", "_sixtyfourth"),
+]
 
 PROMPT_TEXT = (
 	"Image: 180° crop from a RICOH THETA Z1 on the humanoid robot Robovie 2. "
@@ -92,6 +101,12 @@ def list_images(root: Path) -> list[Path]:
 	return paths
 
 
+def append_suffix(path: Path, suffix: str) -> Path:
+	if not suffix:
+		return path
+	return path.with_name(f"{path.stem}{suffix}{path.suffix}")
+
+
 def ensure_trimmed_images(source_root: Path, trimmed_root: Path) -> None:
 	"""Crop source images once into ``trimmed_root`` and reuse them on later runs."""
 	if trimmed_root.exists():
@@ -105,6 +120,26 @@ def ensure_trimmed_images(source_root: Path, trimmed_root: Path) -> None:
 			with Image.open(image_path) as image:
 				cropped = image.crop(CROP_BOX)
 				cropped.save(target_dir / image_path.name)
+
+
+def ensure_scaled_images(trimmed_root: Path, scale: float, label: str) -> Path:
+	if math.isclose(scale, 1.0):
+		return trimmed_root
+	scaled_root = trimmed_root.parent / f"{trimmed_root.name}_{label}"
+	if scaled_root.exists():
+		return scaled_root
+	for sequence_dir in sorted(path for path in trimmed_root.iterdir() if path.is_dir()):
+		target_dir = scaled_root / sequence_dir.name
+		target_dir.mkdir(parents=True, exist_ok=True)
+		for image_path in sorted(sequence_dir.glob("*.png")):
+			with Image.open(image_path) as image:
+				new_size = (
+					max(1, int(round(image.width * scale))),
+					max(1, int(round(image.height * scale))),
+				)
+				resized = image.resize(new_size, Image.LANCZOS)
+				resized.save(target_dir / image_path.name)
+	return scaled_root
 
 
 def expected_label(path: Path) -> int:
@@ -342,7 +377,7 @@ def save_label_heatmaps(results: list[Result], output_dir: Path) -> list[Path]:
 	return saved_paths
 
 
-def save_latency_plot(latencies: list[float], path: Path) -> None:
+def save_latency_plot(latencies: list[float], path: Path, title: str = "OpenAI response times") -> None:
 	if not latencies:
 		return
 	path.parent.mkdir(parents=True, exist_ok=True)
@@ -351,8 +386,27 @@ def save_latency_plot(latencies: list[float], path: Path) -> None:
 	plt.plot(indices, latencies, marker="o")
 	plt.xlabel("Request index")
 	plt.ylabel("Response time (s)")
-	plt.title("OpenAI response times")
+	plt.title(title)
 	plt.grid(True, linestyle="--", alpha=0.4)
+	plt.tight_layout()
+	plt.savefig(path, dpi=200)
+	plt.close()
+
+
+def save_combined_latency_plot(latency_map: dict[str, list[float]], path: Path) -> None:
+	valid = {label: latencies for label, latencies in latency_map.items() if latencies}
+	if not valid:
+		return
+	path.parent.mkdir(parents=True, exist_ok=True)
+	plt.figure(figsize=(10, 4))
+	for label, latencies in sorted(valid.items()):
+		indices = list(range(1, len(latencies) + 1))
+		plt.plot(indices, latencies, marker="o", label=label)
+	plt.xlabel("Request index")
+	plt.ylabel("Response time (s)")
+	plt.title("Response times (all scales)")
+	plt.grid(True, linestyle="--", alpha=0.4)
+	plt.legend()
 	plt.tight_layout()
 	plt.savefig(path, dpi=200)
 	plt.close()
@@ -363,50 +417,64 @@ def main() -> None:
 	ensure_trimmed_images(args.image_root, args.trimmed_root)
 	client = build_client()
 
-	paths = list_images(args.trimmed_root)
-	if args.limit is not None:
-		paths = paths[: args.limit]
+	combined_latencies: dict[str, list[float]] = {}
 
-	results = iterate_results(client, paths, pause=args.pause)
+	for scale, label, suffix in SCALE_CONFIGS:
+		scaled_root = ensure_scaled_images(args.trimmed_root, scale, label)
+		paths = list_images(scaled_root)
+		if args.limit is not None:
+			paths = paths[: args.limit]
 
-	overall, per_label, frame_accuracy, frame_label_accuracy = summarise(results)
+		print(f"\n=== Evaluation for {label} (scale ×{scale:.3f}) ===")
+		results = iterate_results(client, paths, pause=args.pause)
+		overall, per_label, frame_accuracy, frame_label_accuracy = summarise(results)
 
-	print("\n=== Accuracy summary ===")
-	print(f"Overall: {overall:.3%} ({sum(r.correct for r in results)}/{len(results)})")
-	for label in sorted(per_label):
-		print(f"Label {label}: {per_label[label]:.3%}")
+		print(f"Overall: {overall:.3%} ({sum(r.correct for r in results)}/{len(results)})")
+		for lbl in sorted(per_label):
+			print(f"Label {lbl}: {per_label[lbl]:.3%}")
 
-	print("\nFrame accuracy:")
-	for frame in sorted(frame_accuracy):
-		accuracy = frame_accuracy[frame]
-		print(f"Frame {frame:02d}: {accuracy:.3%}")
-		label_breakdown = frame_label_accuracy.get(frame, {})
-		for label in sorted(label_breakdown):
-			print(f"  Label {label}: {label_breakdown[label]:.3%}")
+		print("Frame accuracy:")
+		for frame in sorted(frame_accuracy):
+			accuracy = frame_accuracy[frame]
+			print(f"  Frame {frame:02d}: {accuracy:.3%}")
+			label_breakdown = frame_label_accuracy.get(frame, {})
+			for lbl in sorted(label_breakdown):
+				print(f"    Label {lbl}: {label_breakdown[lbl]:.3%}")
 
-	latencies = [result.latency for result in results]
-	if latencies:
-		average_latency = statistics.mean(latencies)
-		print(f"\nAverage response time: {average_latency:.2f}s over {len(latencies)} requests")
-	else:
-		print("\nAverage response time: n/a (no results)")
+		latencies = [result.latency for result in results]
+		if latencies:
+			average_latency = statistics.mean(latencies)
+			print(f"Average response time: {average_latency:.2f}s over {len(latencies)} requests")
+		else:
+			print("Average response time: n/a (no results)")
+		combined_latencies[label] = latencies
 
-	save_results(results, args.output_json)
-	save_frame_plot(frame_accuracy, frame_label_accuracy, args.frame_plot)
-	save_latency_plot(latencies, args.latency_plot)
-	heatmap_paths = save_label_heatmaps(results, HEATMAP_DIR)
+		results_path = append_suffix(args.output_json, suffix)
+		frame_plot_path = append_suffix(args.frame_plot, suffix)
+		latency_plot_path = append_suffix(args.latency_plot, suffix)
+		heatmap_dir = HEATMAP_DIR / label
 
-	print(f"\nSaved details to {args.output_json}")
-	print(f"Saved frame plot to {args.frame_plot}")
-	if latencies:
-		print(f"Saved latency plot to {args.latency_plot}")
-	else:
-		print("Latency plot not generated (no results).")
-	if heatmap_paths:
-		for path in heatmap_paths:
-			print(f"Saved label heatmap to {path}")
-	else:
-		print("No heatmaps generated (no results).")
+		save_results(results, results_path)
+		save_frame_plot(frame_accuracy, frame_label_accuracy, frame_plot_path)
+		save_latency_plot(latencies, latency_plot_path, title=f"Response times ({label})")
+		heatmap_paths = save_label_heatmaps(results, heatmap_dir)
+
+		print(f"Saved details to {results_path}")
+		print(f"Saved frame plot to {frame_plot_path}")
+		if latencies:
+			print(f"Saved latency plot to {latency_plot_path}")
+		else:
+			print("Latency plot not generated (no results).")
+		if heatmap_paths:
+			for path in heatmap_paths:
+				print(f"Saved label heatmap to {path}")
+		else:
+			print("No heatmaps generated (no results).")
+
+	combined_path = args.latency_plot.with_name(f"{args.latency_plot.stem}_combined{args.latency_plot.suffix}")
+	save_combined_latency_plot(combined_latencies, combined_path)
+	if any(latencies for latencies in combined_latencies.values()):
+		print(f"\nSaved combined latency plot to {combined_path}")
 
 
 if __name__ == "__main__":
