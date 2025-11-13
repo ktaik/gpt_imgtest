@@ -16,12 +16,14 @@ from typing import Optional
 import statistics
 
 import matplotlib.pyplot as plt
+from matplotlib.ticker import MultipleLocator
 from PIL import Image
 from dotenv import load_dotenv
 from openai import OpenAI
 
 
-HEATMAP_DIR = Path("plots")
+OUTPUT_DIR = Path("outputs")
+HEATMAP_DIR = OUTPUT_DIR / "plots"
 CROP_BOX = (556, 69, 1465, 977)
 SCALE_CONFIGS: list[tuple[float, str, str]] = [
 	(1.0, "orig", ""),
@@ -291,6 +293,7 @@ def save_results(results: list[Result], path: Path) -> None:
 		}
 		for r in results
 	]
+	path.parent.mkdir(parents=True, exist_ok=True)
 	path.write_text(json.dumps(serialised, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
@@ -387,7 +390,11 @@ def save_latency_plot(latencies: list[float], path: Path, title: str = "OpenAI r
 	plt.xlabel("Request index")
 	plt.ylabel("Response time (s)")
 	plt.title(title)
-	plt.grid(True, linestyle="--", alpha=0.4)
+	plt.grid(False)
+	ax = plt.gca()
+	ax.yaxis.set_major_locator(MultipleLocator(0.1))
+	for y in ax.get_yticks():
+		ax.axhline(y, color="gray", linestyle=":", linewidth=0.5, alpha=0.6)
 	plt.tight_layout()
 	plt.savefig(path, dpi=200)
 	plt.close()
@@ -405,7 +412,11 @@ def save_combined_latency_plot(latency_map: dict[str, list[float]], path: Path) 
 	plt.xlabel("Request index")
 	plt.ylabel("Response time (s)")
 	plt.title("Response times (all scales)")
-	plt.grid(True, linestyle="--", alpha=0.4)
+	plt.grid(False)
+	ax = plt.gca()
+	ax.yaxis.set_major_locator(MultipleLocator(0.1))
+	for y in ax.get_yticks():
+		ax.axhline(y, color="gray", linestyle=":", linewidth=0.5, alpha=0.6)
 	plt.legend()
 	plt.tight_layout()
 	plt.savefig(path, dpi=200)
@@ -417,6 +428,12 @@ def main() -> None:
 	ensure_trimmed_images(args.image_root, args.trimmed_root)
 	client = build_client()
 
+	OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+	base_results = OUTPUT_DIR / args.output_json.name
+	base_frame_plot = OUTPUT_DIR / args.frame_plot.name
+	base_latency_plot = OUTPUT_DIR / args.latency_plot.name
+	report_path = OUTPUT_DIR / "summary.txt"
+	report_lines: list[str] = []
 	combined_latencies: dict[str, list[float]] = {}
 
 	for scale, label, suffix in SCALE_CONFIGS:
@@ -426,32 +443,45 @@ def main() -> None:
 			paths = paths[: args.limit]
 
 		print(f"\n=== Evaluation for {label} (scale ×{scale:.3f}) ===")
+		report_lines.append(f"=== Evaluation for {label} (scale ×{scale:.3f}) ===")
 		results = iterate_results(client, paths, pause=args.pause)
 		overall, per_label, frame_accuracy, frame_label_accuracy = summarise(results)
 
-		print(f"Overall: {overall:.3%} ({sum(r.correct for r in results)}/{len(results)})")
+		sum_correct = sum(r.correct for r in results)
+		total = len(results)
+		print(f"Overall: {overall:.3%} ({sum_correct}/{total})")
+		report_lines.append(f"Overall: {overall:.3%} ({sum_correct}/{total})")
 		for lbl in sorted(per_label):
-			print(f"Label {lbl}: {per_label[lbl]:.3%}")
+			txt = f"Label {lbl}: {per_label[lbl]:.3%}"
+			print(txt)
+			report_lines.append(txt)
 
 		print("Frame accuracy:")
+		report_lines.append("Frame accuracy:")
 		for frame in sorted(frame_accuracy):
 			accuracy = frame_accuracy[frame]
-			print(f"  Frame {frame:02d}: {accuracy:.3%}")
+			frame_line = f"  Frame {frame:02d}: {accuracy:.3%}"
+			print(frame_line)
+			report_lines.append(frame_line)
 			label_breakdown = frame_label_accuracy.get(frame, {})
 			for lbl in sorted(label_breakdown):
-				print(f"    Label {lbl}: {label_breakdown[lbl]:.3%}")
+				lbl_line = f"    Label {lbl}: {label_breakdown[lbl]:.3%}"
+				print(lbl_line)
+				report_lines.append(lbl_line)
 
 		latencies = [result.latency for result in results]
 		if latencies:
 			average_latency = statistics.mean(latencies)
-			print(f"Average response time: {average_latency:.2f}s over {len(latencies)} requests")
+			latency_line = f"Average response time: {average_latency:.2f}s over {len(latencies)} requests"
 		else:
-			print("Average response time: n/a (no results)")
+			latency_line = "Average response time: n/a (no results)"
+		print(latency_line)
+		report_lines.append(latency_line)
 		combined_latencies[label] = latencies
 
-		results_path = append_suffix(args.output_json, suffix)
-		frame_plot_path = append_suffix(args.frame_plot, suffix)
-		latency_plot_path = append_suffix(args.latency_plot, suffix)
+		results_path = append_suffix(base_results, suffix)
+		frame_plot_path = append_suffix(base_frame_plot, suffix)
+		latency_plot_path = append_suffix(base_latency_plot, suffix)
 		heatmap_dir = HEATMAP_DIR / label
 
 		save_results(results, results_path)
@@ -459,22 +489,48 @@ def main() -> None:
 		save_latency_plot(latencies, latency_plot_path, title=f"Response times ({label})")
 		heatmap_paths = save_label_heatmaps(results, heatmap_dir)
 
-		print(f"Saved details to {results_path}")
-		print(f"Saved frame plot to {frame_plot_path}")
+		saved_lines = [
+			f"Saved details to {results_path}",
+			f"Saved frame plot to {frame_plot_path}",
+		]
+		for message in saved_lines:
+			print(message)
+			report_lines.append(message)
 		if latencies:
-			print(f"Saved latency plot to {latency_plot_path}")
+			latency_save = f"Saved latency plot to {latency_plot_path}"
+			print(latency_save)
+			report_lines.append(latency_save)
 		else:
-			print("Latency plot not generated (no results).")
+			no_latency = "Latency plot not generated (no results)."
+			print(no_latency)
+			report_lines.append(no_latency)
 		if heatmap_paths:
 			for path in heatmap_paths:
-				print(f"Saved label heatmap to {path}")
+				heat_line = f"Saved label heatmap to {path}"
+				print(heat_line)
+				report_lines.append(heat_line)
 		else:
-			print("No heatmaps generated (no results).")
+			no_heat = "No heatmaps generated (no results)."
+			print(no_heat)
+			report_lines.append(no_heat)
+		report_lines.append("")
 
-	combined_path = args.latency_plot.with_name(f"{args.latency_plot.stem}_combined{args.latency_plot.suffix}")
+	combined_path = base_latency_plot.with_name(f"{base_latency_plot.stem}_combined{base_latency_plot.suffix}")
 	save_combined_latency_plot(combined_latencies, combined_path)
 	if any(latencies for latencies in combined_latencies.values()):
-		print(f"\nSaved combined latency plot to {combined_path}")
+		combined_msg = f"Saved combined latency plot to {combined_path}"
+		print(f"\n{combined_msg}")
+		report_lines.append(combined_msg)
+	else:
+		no_combined = "Combined latency plot not generated (no results)."
+		print(f"\n{no_combined}")
+		report_lines.append(no_combined)
+
+	report_lines.append("")
+	summary_msg = f"Summary saved to {report_path}"
+	print(summary_msg)
+	report_lines.append(summary_msg)
+	report_path.write_text("\n".join(report_lines).strip() + "\n", encoding="utf-8")
 
 
 if __name__ == "__main__":
