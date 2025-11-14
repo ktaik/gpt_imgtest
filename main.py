@@ -14,9 +14,10 @@ from pathlib import Path
 from typing import Optional
 
 import statistics
+import shutil
 
 import matplotlib.pyplot as plt
-from matplotlib.ticker import MultipleLocator
+from matplotlib.ticker import MaxNLocator, MultipleLocator
 from PIL import Image
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -26,7 +27,7 @@ OUTPUT_DIR = Path("outputs")
 HEATMAP_DIR = OUTPUT_DIR / "plots"
 CROP_BOX = (556, 69, 1465, 977)
 SCALE_CONFIGS: list[tuple[float, str, str]] = [
-	(1.0, "orig", ""),
+	(1.0, "original", ""),
 	(0.5, "half", "_half"),
 	(0.25, "quarter", "_quarter"),
 	(0.125, "eighth", "_eighth"),
@@ -34,18 +35,39 @@ SCALE_CONFIGS: list[tuple[float, str, str]] = [
 	(0.03125, "thirtysecond", "_thirtysecond"),
 	(0.015625, "sixtyfourth", "_sixtyfourth"),
 ]
+SCALE_LABELS = {label for _, label, _ in SCALE_CONFIGS}
 
 PROMPT_TEXT = (
-	"Image: 180° crop from a RICOH THETA Z1 on the humanoid robot Robovie 2. "
-	"Center faces forward; left/right edges are the robot's sides; top/bottom are up/down. "
-	"Yellow shapes near the lower corners are the robot's eyes.\n\n"
-	"Decide whether the human behavior intentionally blocks the robot's path.\n"
-	"- Label 1 = malicious obstruction with the primary goal of blocking.\n"
-	"- Label 0 = non-malicious, incidental, or no person present.\n"
-	"- Calmly standing without hostile cues = 0.\n"
-	"- Anyone not directly ahead, or empty scenes = 0.\n"
-	"- Blocking gestures (arms/legs spread, tripping foot, crab walk), hitting/pushing, or covering the eyes = 1.\n\n"
-	"Respond exactly as JSON: {\"label\": <0 or 1>, \"reason\": \"<concise English justification>\"}."
+	"The received image is a 180-degree crop from a RICOH THETA Z1 camera mounted "
+	"on top of the humanoid robot Robovie 2. The center of the crop corresponds "
+	"to the robot's forward direction; the left and right edges correspond to the "
+	"robot's left and right sides; the top and bottom edges correspond to upward "
+	"and downward directions. The yellow objects that appear symmetrically near "
+	"the lower left and lower right are Robovie's eyes.\n\n"
+	"Judge whether the human behavior in the image is an \"intentional malicious "
+	"action whose primary goal is to obstruct the robot's path\" (label 1) or a "
+	"\"non-malicious action whose primary goal is not to obstruct the robot's path\" "
+	"(label 0). When you decide:\n"
+	"- Treat someone simply standing in front of the robot without malicious cues as non-malicious, even if the path is blocked.\n"
+	"- Treat anyone who is not standing directly in front of the robot, as well as scenes with no person present, as non-malicious.\n\n"
+	"After making the judgment, respond in JSON with the keys \"label\" (0 or 1) "
+	"and \"reason\" (a concise English sentence explaining the decision).\n\n"
+	"Examples characteristic of malicious actions include:\n"
+	"- Spreading both arms in front of the robot\n"
+	"- Spreading feet in front of the robot\n"
+	"- Extending a foot in front of the robot\n"
+	"- Stopping in front of the robot without facing it\n"
+	"- Moving sideways like a crab walk in front of the robot\n"
+	"- Hitting, punching, or pushing the robot\n"
+	"- Continuously blindfolding or covering the robot's eyes\n\n"
+	"Examples characteristic of non-malicious actions include:\n"
+	"- Peering at the robot's face or body from the side or diagonally in front\n"
+	"- Walking alongside the robot from behind, beside, or diagonally in front at a matching speed\n"
+	"- Calmly standing in front of the robot without malicious characteristics\n"
+	"- Gently touching or stroking the robot\n"
+	"- Scenes where no person is present\n\n"
+	"Respond in the following JSON format:\n"
+	'{"label": <0 or 1>, "reason": "..."}'
 )
 
 
@@ -109,28 +131,57 @@ def append_suffix(path: Path, suffix: str) -> Path:
 	return path.with_name(f"{path.stem}{suffix}{path.suffix}")
 
 
-def ensure_trimmed_images(source_root: Path, trimmed_root: Path) -> None:
-	"""Crop source images once into ``trimmed_root`` and reuse them on later runs."""
-	if trimmed_root.exists():
-		return
+def ensure_trimmed_images(source_root: Path, trimmed_root: Path) -> Path:
+	"""Ensure cropped images live under ``trimmed_root / "original"``."""
+	trimmed_root.mkdir(parents=True, exist_ok=True)
+	original_root = trimmed_root / "original"
+	if original_root.exists():
+		return original_root
+
+	# Migrate legacy layout where sequences sat directly under ``trimmed_root``.
+	legacy_children = [
+		path
+		for path in trimmed_root.iterdir()
+		if path.is_dir() and path.name not in SCALE_LABELS
+	]
+	if legacy_children:
+		original_root.mkdir(parents=True, exist_ok=True)
+		for legacy_dir in legacy_children:
+			target_dir = original_root / legacy_dir.name
+			if target_dir.exists():
+				continue
+			shutil.move(str(legacy_dir), str(target_dir))
+		return original_root
+
 	if not source_root.exists():
 		raise FileNotFoundError(f"Source image directory not found: {source_root}")
+	original_root.mkdir(parents=True, exist_ok=True)
 	for sequence_dir in sorted(path for path in source_root.iterdir() if path.is_dir()):
-		target_dir = trimmed_root / sequence_dir.name
+		target_dir = original_root / sequence_dir.name
 		target_dir.mkdir(parents=True, exist_ok=True)
 		for image_path in sorted(sequence_dir.glob("*.png")):
 			with Image.open(image_path) as image:
 				cropped = image.crop(CROP_BOX)
 				cropped.save(target_dir / image_path.name)
+	return original_root
 
 
 def ensure_scaled_images(trimmed_root: Path, scale: float, label: str) -> Path:
+	original_root = trimmed_root / "original"
+	if not original_root.exists():
+		raise FileNotFoundError(f"Original trimmed images not found: {original_root}")
 	if math.isclose(scale, 1.0):
-		return trimmed_root
-	scaled_root = trimmed_root.parent / f"{trimmed_root.name}_{label}"
+		return original_root
+
+	scaled_root = trimmed_root / label
+	legacy_root = trimmed_root.parent / f"{trimmed_root.name}_{label}"
 	if scaled_root.exists():
 		return scaled_root
-	for sequence_dir in sorted(path for path in trimmed_root.iterdir() if path.is_dir()):
+	if legacy_root.exists():
+		shutil.move(str(legacy_root), str(scaled_root))
+		return scaled_root
+
+	for sequence_dir in sorted(path for path in original_root.iterdir() if path.is_dir()):
 		target_dir = scaled_root / sequence_dir.name
 		target_dir.mkdir(parents=True, exist_ok=True)
 		for image_path in sorted(sequence_dir.glob("*.png")):
@@ -140,7 +191,8 @@ def ensure_scaled_images(trimmed_root: Path, scale: float, label: str) -> Path:
 					max(1, int(round(image.height * scale))),
 				)
 				resized = image.resize(new_size, Image.LANCZOS)
-				resized.save(target_dir / image_path.name)
+				target_path = target_dir / image_path.name
+				resized.save(target_path)
 	return scaled_root
 
 
@@ -166,7 +218,8 @@ def to_data_url(path: Path) -> str:
 def call_gpt(client: OpenAI, image_path: Path) -> str:
 	image_data = to_data_url(image_path)
 	response = client.responses.create(
-		model="gpt-4o",
+		model="gpt-5.1",
+    	reasoning={"effort": "none"},
 		input=[
 			{
 				"role": "user",
@@ -392,7 +445,9 @@ def save_latency_plot(latencies: list[float], path: Path, title: str = "OpenAI r
 	plt.title(title)
 	plt.grid(False)
 	ax = plt.gca()
-	ax.yaxis.set_major_locator(MultipleLocator(0.1))
+	max_latency = max(latencies)
+	ax.set_ylim(0, max_latency * 1.1)
+	ax.yaxis.set_major_locator(MaxNLocator(nbins=12, steps=[1, 2, 5, 10]))
 	for y in ax.get_yticks():
 		ax.axhline(y, color="gray", linestyle=":", linewidth=0.5, alpha=0.6)
 	plt.tight_layout()
@@ -414,7 +469,9 @@ def save_combined_latency_plot(latency_map: dict[str, list[float]], path: Path) 
 	plt.title("Response times (all scales)")
 	plt.grid(False)
 	ax = plt.gca()
-	ax.yaxis.set_major_locator(MultipleLocator(0.1))
+	all_latencies = [value for latencies in valid.values() for value in latencies]
+	ax.set_ylim(0, max(all_latencies) * 1.1)
+	ax.yaxis.set_major_locator(MaxNLocator(nbins=12, steps=[1, 2, 5, 10]))
 	for y in ax.get_yticks():
 		ax.axhline(y, color="gray", linestyle=":", linewidth=0.5, alpha=0.6)
 	plt.legend()
