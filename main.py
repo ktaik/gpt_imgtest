@@ -32,8 +32,6 @@ SCALE_CONFIGS: list[tuple[float, str, str]] = [
 	(0.25, "quarter", "_quarter"),
 	(0.125, "eighth", "_eighth"),
 	(0.0625, "sixteenth", "_sixteenth"),
-	(0.03125, "thirtysecond", "_thirtysecond"),
-	(0.015625, "sixtyfourth", "_sixtyfourth"),
 ]
 SCALE_LABELS = {label for _, label, _ in SCALE_CONFIGS}
 
@@ -42,8 +40,7 @@ PROMPT_TEXT = (
 	"on top of the humanoid robot Robovie 2. The center of the crop corresponds "
 	"to the robot's forward direction; the left and right edges correspond to the "
 	"robot's left and right sides; the top and bottom edges correspond to upward "
-	"and downward directions. The yellow objects that appear symmetrically near "
-	"the lower left and lower right are Robovie's eyes.\n\n"
+	"and downward directions.\n\n"
 	"Judge whether the human behavior in the image is an \"intentional malicious "
 	"action whose primary goal is to obstruct the robot's path\" (label 1) or a "
 	"\"non-malicious action whose primary goal is not to obstruct the robot's path\" "
@@ -56,7 +53,6 @@ PROMPT_TEXT = (
 	"- Spreading both arms in front of the robot\n"
 	"- Spreading feet in front of the robot\n"
 	"- Extending a foot in front of the robot\n"
-	"- Stopping in front of the robot without facing it\n"
 	"- Moving sideways like a crab walk in front of the robot\n"
 	"- Hitting, punching, or pushing the robot\n"
 	"- Continuously blindfolding or covering the robot's eyes\n\n"
@@ -218,8 +214,7 @@ def to_data_url(path: Path) -> str:
 def call_gpt(client: OpenAI, image_path: Path) -> str:
 	image_data = to_data_url(image_path)
 	response = client.responses.create(
-		model="gpt-5.1",
-    	reasoning={"effort": "none"},
+		model="gpt-4o",
 		input=[
 			{
 				"role": "user",
