@@ -17,7 +17,7 @@ import statistics
 import shutil
 
 import matplotlib.pyplot as plt
-from matplotlib.ticker import MaxNLocator, MultipleLocator
+from matplotlib.ticker import MaxNLocator
 from PIL import Image
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -27,13 +27,12 @@ OUTPUT_DIR = Path("outputs")
 HEATMAP_DIR = OUTPUT_DIR / "plots"
 CROP_BOX = (556, 69, 1465, 977)
 SCALE_CONFIGS: list[tuple[float, str, str]] = [
-	(1.0, "original", ""),
-	(0.5, "half", "_half"),
 	(0.25, "quarter", "_quarter"),
 	(0.125, "eighth", "_eighth"),
-	(0.0625, "sixteenth", "_sixteenth"),
 ]
-SCALE_LABELS = {label for _, label, _ in SCALE_CONFIGS}
+SCALE_LABELS = {"original", "half", "quarter", "eighth", "sixteenth", "thirtysecond", "sixtyfourth"}
+FRAMES_PER_REQUEST = 3
+MIN_REQUEST_INTERVAL = 3.0
 
 PROMPT_TEXT = (
 	"The received image is a 180-degree crop from a RICOH THETA Z1 camera mounted "
@@ -82,6 +81,12 @@ class Result:
 		return self.predicted is not None and self.predicted == self.true
 
 
+@dataclass(frozen=True)
+class FrameEntry:
+	display: Path
+	image: Path
+
+
 def parse_args() -> argparse.Namespace:
 	parser = argparse.ArgumentParser(description="Evaluate GPT-4o on Robovie frames.")
 	parser.add_argument("--image-root", type=Path, default=Path("images"))
@@ -125,6 +130,33 @@ def append_suffix(path: Path, suffix: str) -> Path:
 	if not suffix:
 		return path
 	return path.with_name(f"{path.stem}{suffix}{path.suffix}")
+
+
+def reset_output_dir(root: Path) -> None:
+	if root.exists():
+		shutil.rmtree(root)
+	root.mkdir(parents=True, exist_ok=True)
+
+
+def build_request_groups(paths: list[Path], chunk_size: int = FRAMES_PER_REQUEST) -> list[list[FrameEntry]]:
+	"""Cluster frames so one API call can represent ``chunk_size`` consecutive frames."""
+	buckets: dict[tuple[Path, str], list[FrameEntry]] = defaultdict(list)
+	for path in paths:
+		prefix = path.stem.split("_")[0]
+		key = (path.parent, prefix)
+		buckets[key].append(FrameEntry(display=path, image=path))
+	grouped: list[list[FrameEntry]] = []
+	for key in sorted(buckets.keys()):
+		bucket_entries = sorted(buckets[key], key=lambda entry: frame_index(entry.display))
+		for idx in range(0, len(bucket_entries), chunk_size):
+			chunk = bucket_entries[idx : idx + chunk_size]
+			if not chunk:
+				continue
+			while len(chunk) < chunk_size:
+				last_entry = chunk[-1]
+				chunk.append(FrameEntry(display=last_entry.display, image=last_entry.image))
+			grouped.append(chunk)
+	return grouped
 
 
 def ensure_trimmed_images(source_root: Path, trimmed_root: Path) -> Path:
@@ -214,8 +246,7 @@ def to_data_url(path: Path) -> str:
 def call_gpt(client: OpenAI, image_path: Path) -> str:
 	image_data = to_data_url(image_path)
 	response = client.responses.create(
-		model="gpt-5.1",
-		reasoning={"effort": "none"},
+		model="gpt-4o",
 		input=[
 			{
 				"role": "user",
@@ -264,25 +295,43 @@ def parse_response(raw: str) -> tuple[Optional[int], Optional[str]]:
 	return None, reason if isinstance(reason, str) else None
 
 
-def iterate_results(client: OpenAI, paths: list[Path], pause: float) -> list[Result]:
+def iterate_results(
+	client: OpenAI,
+	grouped_entries: list[list[FrameEntry]],
+	representative_index: int,
+	pause: float,
+	min_interval: float = MIN_REQUEST_INTERVAL,
+) -> tuple[list[Result], list[float]]:
 	results: list[Result] = []
-	for idx, path in enumerate(paths, start=1):
-		truth = expected_label(path)
-		frame = frame_index(path)
-		raw, latency = safe_predict(client, path)
+	request_latencies: list[float] = []
+	total_groups = len(grouped_entries)
+	for idx, group in enumerate(grouped_entries, start=1):
+		rep_pos = min(representative_index, len(group) - 1)
+		representative = group[rep_pos]
+		raw, latency = safe_predict(client, representative.image)
+		request_latencies.append(latency)
 		pred, reason = parse_response(raw)
 
+		truth = expected_label(representative.display)
+		frame = frame_index(representative.display)
 		results.append(
-			Result(path=path, frame=frame, true=truth, predicted=pred, reason=reason, raw=raw, latency=latency)
+			Result(path=representative.display, frame=frame, true=truth, predicted=pred, reason=reason, raw=raw, latency=latency)
 		)
 
+		truth_rep = truth
+		group_note = f" (+{len(group) - 1} grouped)" if len(group) > 1 else ""
 		print(
-			f"[{idx}] {path} -> truth {truth}, predicted {pred}, correct {pred == truth}, "
-			f"latency {latency:.2f}s"
+			f"[{idx}] {representative.display}{group_note} -> truth {truth_rep}, predicted {pred}, "
+			f"correct {pred == truth_rep}, latency {latency:.2f}s"
 		)
-		if pause:
-			time.sleep(pause)
-	return results
+
+		if idx < total_groups:
+			wait_time = max(0.0, min_interval - latency)
+			if wait_time > 0:
+				time.sleep(wait_time)
+			if pause:
+				time.sleep(pause)
+	return results, request_latencies
 
 
 def summarise(
@@ -478,10 +527,10 @@ def save_combined_latency_plot(latency_map: dict[str, list[float]], path: Path) 
 
 def main() -> None:
 	args = parse_args()
+	reset_output_dir(OUTPUT_DIR)
 	ensure_trimmed_images(args.image_root, args.trimmed_root)
 	client = build_client()
 
-	OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 	base_results = OUTPUT_DIR / args.output_json.name
 	base_frame_plot = OUTPUT_DIR / args.frame_plot.name
 	base_latency_plot = OUTPUT_DIR / args.latency_plot.name
@@ -492,81 +541,91 @@ def main() -> None:
 	for scale, label, suffix in SCALE_CONFIGS:
 		scaled_root = ensure_scaled_images(args.trimmed_root, scale, label)
 		paths = list_images(scaled_root)
+		grouped_entries = build_request_groups(paths, chunk_size=FRAMES_PER_REQUEST)
 		if args.limit is not None:
-			paths = paths[: args.limit]
+			grouped_entries = grouped_entries[: args.limit]
 
-		print(f"\n=== Evaluation for {label} (scale ×{scale:.3f}) ===")
-		report_lines.append(f"=== Evaluation for {label} (scale ×{scale:.3f}) ===")
-		results = iterate_results(client, paths, pause=args.pause)
-		overall, per_label, frame_accuracy, frame_label_accuracy = summarise(results)
+		for shift_idx in range(FRAMES_PER_REQUEST):
+			shift_label = f"shift{shift_idx + 1}"
+			suffix_with_shift = suffix + f"_{shift_label}"
+			print(f"\n=== Evaluation for {label} ({shift_label}, scale ×{scale:.3f}) ===")
+			report_lines.append(f"=== Evaluation for {label} ({shift_label}, scale ×{scale:.3f}) ===")
+			results, request_latencies = iterate_results(
+				client,
+				grouped_entries,
+				representative_index=shift_idx,
+				pause=args.pause,
+			)
+			overall, per_label, frame_accuracy, frame_label_accuracy = summarise(results)
 
-		sum_correct = sum(r.correct for r in results)
-		total = len(results)
-		print(f"Overall: {overall:.3%} ({sum_correct}/{total})")
-		report_lines.append(f"Overall: {overall:.3%} ({sum_correct}/{total})")
-		for lbl in sorted(per_label):
-			txt = f"Label {lbl}: {per_label[lbl]:.3%}"
-			print(txt)
-			report_lines.append(txt)
+			sum_correct = sum(r.correct for r in results)
+			total = len(results)
+			print(f"Overall: {overall:.3%} ({sum_correct}/{total})")
+			report_lines.append(f"Overall: {overall:.3%} ({sum_correct}/{total})")
+			for lbl in sorted(per_label):
+				txt = f"Label {lbl}: {per_label[lbl]:.3%}"
+				print(txt)
+				report_lines.append(txt)
 
-		print("Frame accuracy:")
-		report_lines.append("Frame accuracy:")
-		for frame in sorted(frame_accuracy):
-			accuracy = frame_accuracy[frame]
-			frame_line = f"  Frame {frame:02d}: {accuracy:.3%}"
-			print(frame_line)
-			report_lines.append(frame_line)
-			label_breakdown = frame_label_accuracy.get(frame, {})
-			for lbl in sorted(label_breakdown):
-				lbl_line = f"    Label {lbl}: {label_breakdown[lbl]:.3%}"
-				print(lbl_line)
-				report_lines.append(lbl_line)
+			print("Frame accuracy:")
+			report_lines.append("Frame accuracy:")
+			for frame in sorted(frame_accuracy):
+				accuracy = frame_accuracy[frame]
+				frame_line = f"  Frame {frame:02d}: {accuracy:.3%}"
+				print(frame_line)
+				report_lines.append(frame_line)
+				label_breakdown = frame_label_accuracy.get(frame, {})
+				for lbl in sorted(label_breakdown):
+					lbl_line = f"    Label {lbl}: {label_breakdown[lbl]:.3%}"
+					print(lbl_line)
+					report_lines.append(lbl_line)
 
-		latencies = [result.latency for result in results]
-		if latencies:
-			average_latency = statistics.mean(latencies)
-			latency_line = f"Average response time: {average_latency:.2f}s over {len(latencies)} requests"
-		else:
-			latency_line = "Average response time: n/a (no results)"
-		print(latency_line)
-		report_lines.append(latency_line)
-		combined_latencies[label] = latencies
+			latencies = request_latencies
+			if latencies:
+				average_latency = statistics.mean(latencies)
+				latency_line = f"Average response time: {average_latency:.2f}s over {len(latencies)} requests"
+			else:
+				latency_line = "Average response time: n/a (no results)"
+			print(latency_line)
+			report_lines.append(latency_line)
+			combined_key = f"{label}-{shift_label}"
+			combined_latencies[combined_key] = latencies
 
-		results_path = append_suffix(base_results, suffix)
-		frame_plot_path = append_suffix(base_frame_plot, suffix)
-		latency_plot_path = append_suffix(base_latency_plot, suffix)
-		heatmap_dir = HEATMAP_DIR / label
+			results_path = append_suffix(base_results, suffix_with_shift)
+			frame_plot_path = append_suffix(base_frame_plot, suffix_with_shift)
+			latency_plot_path = append_suffix(base_latency_plot, suffix_with_shift)
+			heatmap_dir = HEATMAP_DIR / label / shift_label
 
-		save_results(results, results_path)
-		save_frame_plot(frame_accuracy, frame_label_accuracy, frame_plot_path)
-		save_latency_plot(latencies, latency_plot_path, title=f"Response times ({label})")
-		heatmap_paths = save_label_heatmaps(results, heatmap_dir)
+			save_results(results, results_path)
+			save_frame_plot(frame_accuracy, frame_label_accuracy, frame_plot_path)
+			save_latency_plot(latencies, latency_plot_path, title=f"Response times ({label}, {shift_label})")
+			heatmap_paths = save_label_heatmaps(results, heatmap_dir)
 
-		saved_lines = [
-			f"Saved details to {results_path}",
-			f"Saved frame plot to {frame_plot_path}",
-		]
-		for message in saved_lines:
-			print(message)
-			report_lines.append(message)
-		if latencies:
-			latency_save = f"Saved latency plot to {latency_plot_path}"
-			print(latency_save)
-			report_lines.append(latency_save)
-		else:
-			no_latency = "Latency plot not generated (no results)."
-			print(no_latency)
-			report_lines.append(no_latency)
-		if heatmap_paths:
-			for path in heatmap_paths:
-				heat_line = f"Saved label heatmap to {path}"
-				print(heat_line)
-				report_lines.append(heat_line)
-		else:
-			no_heat = "No heatmaps generated (no results)."
-			print(no_heat)
-			report_lines.append(no_heat)
-		report_lines.append("")
+			saved_lines = [
+				f"Saved details to {results_path}",
+				f"Saved frame plot to {frame_plot_path}",
+			]
+			for message in saved_lines:
+				print(message)
+				report_lines.append(message)
+			if latencies:
+				latency_save = f"Saved latency plot to {latency_plot_path}"
+				print(latency_save)
+				report_lines.append(latency_save)
+			else:
+				no_latency = "Latency plot not generated (no results)."
+				print(no_latency)
+				report_lines.append(no_latency)
+			if heatmap_paths:
+				for path in heatmap_paths:
+					heat_line = f"Saved label heatmap to {path}"
+					print(heat_line)
+					report_lines.append(heat_line)
+			else:
+				no_heat = "No heatmaps generated (no results)."
+				print(no_heat)
+				report_lines.append(no_heat)
+			report_lines.append("")
 
 	combined_path = base_latency_plot.with_name(f"{base_latency_plot.stem}_combined{base_latency_plot.suffix}")
 	save_combined_latency_plot(combined_latencies, combined_path)
