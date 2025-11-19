@@ -11,10 +11,11 @@ import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Iterable
 
 import statistics
 import shutil
+import numpy as np
 
 import matplotlib.pyplot as plt
 from matplotlib.ticker import MaxNLocator
@@ -28,11 +29,24 @@ HEATMAP_DIR = OUTPUT_DIR / "plots"
 CROP_BOX = (556, 69, 1465, 977)
 SCALE_CONFIGS: list[tuple[float, str, str]] = [
 	(0.25, "quarter", "_quarter"),
-	(0.125, "eighth", "_eighth"),
 ]
 SCALE_LABELS = {"original", "half", "quarter", "eighth", "sixteenth", "thirtysecond", "sixtyfourth"}
 FRAMES_PER_REQUEST = 3
 MIN_REQUEST_INTERVAL = 3.0
+
+HMM_TRANSITION = np.array(
+	[
+		[0.95, 0.05],
+		[0.05, 0.95],
+	]
+)
+HMM_EMISSION = np.array(
+	[
+		[0.9365, 0.06349],
+		[0.7196, 0.2804],
+	]
+)
+HMM_PRIOR = np.array([0.9, 0.1])
 
 PROMPT_TEXT = (
 	"The received image is a 180-degree crop from a RICOH THETA Z1 camera mounted "
@@ -75,6 +89,8 @@ class Result:
 	reason: Optional[str]
 	raw: str
 	latency: float
+	hmm_prob: Optional[float] = None
+	hmm_label: Optional[int] = None
 
 	@property
 	def correct(self) -> bool:
@@ -86,6 +102,39 @@ class FrameEntry:
 	display: Path
 	image: Path
 
+
+class OnlineHMMFilter:
+	def __init__(self, transition: np.ndarray, emission: np.ndarray, prior: np.ndarray) -> None:
+		self.transition = transition.astype(float)
+		self.emission = emission.astype(float)
+		prior = prior.astype(float)
+		if prior.sum() == 0:
+			raise ValueError("HMM prior must sum to a non-zero value")
+		self.initial = prior / prior.sum()
+		self.belief = self.initial.copy()
+
+	def reset(self) -> None:
+		self.belief = self.initial.copy()
+
+	def update(self, observation: Optional[int]) -> np.ndarray:
+		pred = self.transition.T @ self.belief
+		pred_sum = pred.sum()
+		if pred_sum > 0:
+			pred /= pred_sum
+		else:
+			pred = self.initial.copy()
+
+		if observation in (0, 1):
+			likelihood = self.emission[:, observation]
+			posterior = likelihood * pred
+			post_sum = posterior.sum()
+			if post_sum > 0:
+				self.belief = posterior / post_sum
+			else:
+				self.belief = self.initial.copy()
+		else:
+			self.belief = pred
+		return self.belief
 
 def parse_args() -> argparse.Namespace:
 	parser = argparse.ArgumentParser(description="Evaluate GPT-4o on Robovie frames.")
@@ -136,6 +185,17 @@ def reset_output_dir(root: Path) -> None:
 	if root.exists():
 		shutil.rmtree(root)
 	root.mkdir(parents=True, exist_ok=True)
+
+
+def trial_key(path: Path) -> tuple[str, str]:
+	segment = path.stem.split("_")[0]
+	participant = path.parent.name
+	return participant, segment
+
+
+def result_trial_id(result: Result) -> str:
+	participant, segment = trial_key(result.path)
+	return f"{participant}-{segment}"
 
 
 def build_request_groups(paths: list[Path], chunk_size: int = FRAMES_PER_REQUEST) -> list[list[FrameEntry]]:
@@ -295,6 +355,22 @@ def parse_response(raw: str) -> tuple[Optional[int], Optional[str]]:
 	return None, reason if isinstance(reason, str) else None
 
 
+def apply_hmm_filter(results: Iterable[Result]) -> None:
+	groups: dict[tuple[str, str], list[Result]] = defaultdict(list)
+	for result in results:
+		groups[trial_key(result.path)].append(result)
+
+	for group in groups.values():
+		group.sort(key=lambda entry: entry.frame)
+		filter_ = OnlineHMMFilter(HMM_TRANSITION, HMM_EMISSION, HMM_PRIOR)
+		filter_.reset()
+		for result in group:
+			observation = result.predicted if result.predicted in (0, 1) else None
+			belief = filter_.update(observation)
+			result.hmm_prob = float(belief[1])
+			result.hmm_label = 1 if result.hmm_prob >= 0.5 else 0
+
+
 def iterate_results(
 	client: OpenAI,
 	grouped_entries: list[list[FrameEntry]],
@@ -370,11 +446,94 @@ def summarise(
 		label_totals = per_frame_label_totals[frame]
 		label_correct = per_frame_label_correct[frame]
 		frame_label_accuracy[frame] = {
-			label: (label_correct[label] / total if total else 0.0)
-			for label, total in label_totals.items()
+			label: (label_correct[label] / count) if count else 0.0
+			for label, count in label_totals.items()
 		}
 
 	return correct_total / total, per_label_accuracy, frame_accuracy, frame_label_accuracy
+
+
+def summarise_hmm(results: list[Result]) -> tuple[float, dict[int, float], dict[int, float], dict[int, dict[int, float]]]:
+	hmm_results = [result for result in results if result.hmm_label is not None]
+	total = len(hmm_results)
+	if total == 0:
+		return 0.0, {}, {}, {}
+
+	correct_total = sum(result.hmm_label == result.true for result in hmm_results)
+
+	per_label_totals: Counter[int] = Counter(result.true for result in hmm_results)
+	per_label_correct: Counter[int] = Counter(result.true for result in hmm_results if result.hmm_label == result.true)
+
+	per_frame_flags: defaultdict[int, list[bool]] = defaultdict(list)
+	per_frame_label_totals: defaultdict[int, Counter[int]] = defaultdict(Counter)
+	per_frame_label_correct: defaultdict[int, Counter[int]] = defaultdict(Counter)
+	for result in hmm_results:
+		per_frame_flags[result.frame].append(result.hmm_label == result.true)
+		per_frame_label_totals[result.frame][result.true] += 1
+		if result.hmm_label == result.true:
+			per_frame_label_correct[result.frame][result.true] += 1
+
+	per_label_accuracy = {
+		label: per_label_correct[label] / count if count else 0.0
+		for label, count in per_label_totals.items()
+	}
+
+	frame_accuracy = {
+		frame: sum(flags) / len(flags) if flags else 0.0
+		for frame, flags in sorted(per_frame_flags.items())
+	}
+
+	frame_label_accuracy: dict[int, dict[int, float]] = {}
+	for frame in sorted(per_frame_label_totals.keys()):
+		label_totals = per_frame_label_totals[frame]
+		label_correct = per_frame_label_correct[frame]
+		frame_label_accuracy[frame] = {
+			label: (label_correct[label] / count) if count else 0.0
+			for label, count in label_totals.items()
+		}
+
+	return correct_total / total, per_label_accuracy, frame_accuracy, frame_label_accuracy
+
+
+def summarise_hmm_probabilities(
+	results: list[Result],
+) -> tuple[Optional[float], dict[int, float], dict[int, float], dict[int, dict[int, float]]]:
+	filtered = [result for result in results if result.hmm_prob is not None]
+	if not filtered:
+		return None, {}, {}, {}
+
+	overall_prob = float(statistics.mean(result.hmm_prob for result in filtered))
+
+	label_values: defaultdict[int, list[float]] = defaultdict(list)
+	frame_values: defaultdict[int, list[float]] = defaultdict(list)
+	label_frame_values: defaultdict[int, defaultdict[int, list[float]]] = defaultdict(lambda: defaultdict(list))
+	for result in filtered:
+		prob = float(result.hmm_prob)
+		label_values[result.true].append(prob)
+		frame_values[result.frame].append(prob)
+		label_frame_values[result.true][result.frame].append(prob)
+
+	label_probs = {
+		label: float(statistics.mean(values))
+		for label, values in label_values.items()
+		if values
+	}
+
+	frame_probs = {
+		frame: float(statistics.mean(values))
+		for frame, values in frame_values.items()
+		if values
+	}
+
+	label_frame_probs: dict[int, dict[int, float]] = {}
+	for label, frames in label_frame_values.items():
+		label_frame_probs[label] = {
+			frame: float(statistics.mean(values))
+			for frame, values in frames.items()
+			if values
+		}
+
+	return overall_prob, label_probs, frame_probs, label_frame_probs
 
 
 def save_results(results: list[Result], path: Path) -> None:
@@ -393,7 +552,6 @@ def save_results(results: list[Result], path: Path) -> None:
 	]
 	path.parent.mkdir(parents=True, exist_ok=True)
 	path.write_text(json.dumps(serialised, ensure_ascii=False, indent=2), encoding="utf-8")
-
 
 def save_frame_plot(
 	frame_accuracy: dict[int, float],
@@ -432,11 +590,6 @@ def save_label_heatmaps(results: list[Result], output_dir: Path) -> list[Path]:
 	if not results:
 		return []
 
-	def trial_id(result: Result) -> str:
-		prefix = result.path.stem.split("_")[0]
-		participant = result.path.parent.name
-		return f"{participant}-{prefix}"
-
 	frames = sorted({result.frame for result in results})
 	saved_paths: list[Path] = []
 	for label in sorted({result.true for result in results}):
@@ -444,9 +597,9 @@ def save_label_heatmaps(results: list[Result], output_dir: Path) -> list[Path]:
 		if not label_results:
 			continue
 
-		trials = sorted({trial_id(result) for result in label_results})
+		trials = sorted({result_trial_id(result) for result in label_results})
 		value_map = {
-			(trial_id(result), result.frame): (
+			(result_trial_id(result), result.frame): (
 				float(result.predicted) if result.predicted is not None else math.nan
 			)
 			for result in label_results
@@ -471,6 +624,51 @@ def save_label_heatmaps(results: list[Result], output_dir: Path) -> list[Path]:
 		fig.colorbar(im, ax=ax, label="Predicted label")
 		fig.tight_layout()
 		output_path = output_dir / f"label_{label}_heatmap.png"
+		fig.savefig(output_path, dpi=200)
+		plt.close(fig)
+		saved_paths.append(output_path)
+
+	return saved_paths
+
+
+def save_hmm_heatmaps(results: list[Result], output_dir: Path) -> list[Path]:
+	filtered = [result for result in results if result.hmm_prob is not None]
+	output_dir.mkdir(parents=True, exist_ok=True)
+	if not filtered:
+		return []
+
+	frames = sorted({result.frame for result in filtered})
+	saved_paths: list[Path] = []
+	for label in sorted({result.true for result in filtered}):
+		label_results = [result for result in filtered if result.true == label]
+		if not label_results:
+			continue
+
+		trials = sorted({result_trial_id(result) for result in label_results})
+		value_map = {
+			(result_trial_id(result), result.frame): float(result.hmm_prob)
+			for result in label_results
+		}
+
+		matrix: list[list[float]] = []
+		for trial in trials:
+			row: list[float] = []
+			for frame in frames:
+				row.append(value_map.get((trial, frame), math.nan))
+			matrix.append(row)
+
+		fig, ax = plt.subplots(figsize=(12, max(3, len(trials) * 0.4)))
+		im = ax.imshow(matrix, aspect="auto", interpolation="nearest", vmin=0, vmax=1, cmap="magma")
+		ax.set_xlabel("Frame index")
+		ax.set_ylabel("Trial")
+		ax.set_title(f"HMM filtered P(malicious) (true label {label})")
+		ax.set_xticks(range(len(frames)))
+		ax.set_xticklabels([f"{frame:02d}" for frame in frames], rotation=45)
+		ax.set_yticks(range(len(trials)))
+		ax.set_yticklabels(trials)
+		fig.colorbar(im, ax=ax, label="P(malicious)")
+		fig.tight_layout()
+		output_path = output_dir / f"label_{label}_hmm_heatmap.png"
 		fig.savefig(output_path, dpi=200)
 		plt.close(fig)
 		saved_paths.append(output_path)
@@ -556,7 +754,14 @@ def main() -> None:
 				representative_index=shift_idx,
 				pause=args.pause,
 			)
+			apply_hmm_filter(results)
 			overall, per_label, frame_accuracy, frame_label_accuracy = summarise(results)
+			(
+				hmm_overall_prob,
+				hmm_label_probs,
+				hmm_frame_probs,
+				hmm_label_frame_probs,
+			) = summarise_hmm_probabilities(results)
 
 			sum_correct = sum(r.correct for r in results)
 			total = len(results)
@@ -580,6 +785,34 @@ def main() -> None:
 					print(lbl_line)
 					report_lines.append(lbl_line)
 
+			print("HMM filtered probabilities:")
+			report_lines.append("HMM filtered probabilities:")
+			if hmm_overall_prob is None:
+				no_prob_line = "  No HMM probabilities available."
+				print(no_prob_line)
+				report_lines.append(no_prob_line)
+			else:
+				overall_prob_line = f"  Overall P(malicious): {hmm_overall_prob:.3f}"
+				print(overall_prob_line)
+				report_lines.append(overall_prob_line)
+				if hmm_frame_probs:
+					print("  Frame-wise mean P(malicious):")
+					report_lines.append("  Frame-wise mean P(malicious):")
+					for frame in sorted(hmm_frame_probs):
+						frame_prob_line = f"    Frame {frame:02d}: {hmm_frame_probs[frame]:.3f}"
+						print(frame_prob_line)
+						report_lines.append(frame_prob_line)
+				for lbl in sorted(hmm_label_probs):
+					label_prob_line = f"  Label {lbl} mean P(malicious): {hmm_label_probs[lbl]:.3f}"
+					print(label_prob_line)
+					report_lines.append(label_prob_line)
+					frame_map = hmm_label_frame_probs.get(lbl, {})
+					if frame_map:
+						for frame in sorted(frame_map):
+							lbl_frame_line = f"    Frame {frame:02d}: {frame_map[frame]:.3f}"
+							print(lbl_frame_line)
+							report_lines.append(lbl_frame_line)
+
 			latencies = request_latencies
 			if latencies:
 				average_latency = statistics.mean(latencies)
@@ -595,11 +828,13 @@ def main() -> None:
 			frame_plot_path = append_suffix(base_frame_plot, suffix_with_shift)
 			latency_plot_path = append_suffix(base_latency_plot, suffix_with_shift)
 			heatmap_dir = HEATMAP_DIR / label / shift_label
+			hmm_heatmap_dir = heatmap_dir / "hmm"
 
 			save_results(results, results_path)
 			save_frame_plot(frame_accuracy, frame_label_accuracy, frame_plot_path)
 			save_latency_plot(latencies, latency_plot_path, title=f"Response times ({label}, {shift_label})")
 			heatmap_paths = save_label_heatmaps(results, heatmap_dir)
+			hmm_heatmap_paths = save_hmm_heatmaps(results, hmm_heatmap_dir)
 
 			saved_lines = [
 				f"Saved details to {results_path}",
@@ -616,6 +851,7 @@ def main() -> None:
 				no_latency = "Latency plot not generated (no results)."
 				print(no_latency)
 				report_lines.append(no_latency)
+
 			if heatmap_paths:
 				for path in heatmap_paths:
 					heat_line = f"Saved label heatmap to {path}"
@@ -625,6 +861,15 @@ def main() -> None:
 				no_heat = "No heatmaps generated (no results)."
 				print(no_heat)
 				report_lines.append(no_heat)
+			if hmm_heatmap_paths:
+				for path in hmm_heatmap_paths:
+					heat_line = f"Saved HMM heatmap to {path}"
+					print(heat_line)
+					report_lines.append(heat_line)
+			else:
+				no_hmm_heat = "HMM heatmaps not generated (no results)."
+				print(no_hmm_heat)
+				report_lines.append(no_hmm_heat)
 			report_lines.append("")
 
 	combined_path = base_latency_plot.with_name(f"{base_latency_plot.stem}_combined{base_latency_plot.suffix}")
