@@ -221,9 +221,7 @@ def call_gpt(client: OpenAI, image_path: Path) -> str:
 	image_data = to_data_url(image_path)
 	response = client.responses.create(
 		model="gpt-5.1",
-		store=False,
-		reasoning={"effort": "low"},
-		text={"verbosity": "low"},
+		reasoning={"effort": "medium"},
 		input=[
 			{
 				"role": "user",
