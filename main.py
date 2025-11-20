@@ -127,6 +127,12 @@ def append_suffix(path: Path, suffix: str) -> Path:
 	return path.with_name(f"{path.stem}{suffix}{path.suffix}")
 
 
+def reset_output_dir(root: Path) -> None:
+	if root.exists():
+		shutil.rmtree(root)
+	root.mkdir(parents=True, exist_ok=True)
+
+
 def ensure_trimmed_images(source_root: Path, trimmed_root: Path) -> Path:
 	"""Ensure cropped images live under ``trimmed_root / "original"``."""
 	trimmed_root.mkdir(parents=True, exist_ok=True)
@@ -215,7 +221,7 @@ def call_gpt(client: OpenAI, image_path: Path) -> str:
 	image_data = to_data_url(image_path)
 	response = client.responses.create(
 		model="gpt-5.1",
-		reasoning={"effort": "none"},
+		reasoning={"effort": "low"},
 		input=[
 			{
 				"role": "user",
@@ -478,10 +484,10 @@ def save_combined_latency_plot(latency_map: dict[str, list[float]], path: Path) 
 
 def main() -> None:
 	args = parse_args()
+	reset_output_dir(OUTPUT_DIR)
 	ensure_trimmed_images(args.image_root, args.trimmed_root)
 	client = build_client()
 
-	OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 	base_results = OUTPUT_DIR / args.output_json.name
 	base_frame_plot = OUTPUT_DIR / args.frame_plot.name
 	base_latency_plot = OUTPUT_DIR / args.latency_plot.name
