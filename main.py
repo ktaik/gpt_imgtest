@@ -83,7 +83,7 @@ class Result:
 
 
 def parse_args() -> argparse.Namespace:
-	parser = argparse.ArgumentParser(description="Evaluate GPT-4o on Robovie frames.")
+	parser = argparse.ArgumentParser(description="Evaluate GPT-5.1 on Robovie frames.")
 	parser.add_argument("--image-root", type=Path, default=Path("images"))
 	parser.add_argument(
 		"--trimmed-root",
