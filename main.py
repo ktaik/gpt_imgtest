@@ -35,18 +35,19 @@ FRAMES_PER_REQUEST = 3
 MIN_REQUEST_INTERVAL = 3.0
 
 HMM_TRANSITION = np.array(
-	[
-		[0.95, 0.05],
-		[0.05, 0.95],
-	]
+    [
+        [0.95, 0.05],
+        [0.10, 0.90],
+    ]
 )
+
 HMM_EMISSION = np.array(
 	[
 		[0.9365, 0.06349],
 		[0.7196, 0.2804],
 	]
 )
-HMM_PRIOR = np.array([0.9, 0.1])
+HMM_PRIOR = np.array([0.7, 0.3])
 
 PROMPT_TEXT = (
 	"The received image is a 180-degree crop from a RICOH THETA Z1 camera mounted "
