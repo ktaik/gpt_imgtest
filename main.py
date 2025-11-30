@@ -14,54 +14,29 @@ from pathlib import Path
 from typing import Optional
 
 import statistics
-import shutil
-
 import matplotlib.pyplot as plt
-from matplotlib.ticker import MaxNLocator, MultipleLocator
-from PIL import Image
+from matplotlib.ticker import MaxNLocator
 from dotenv import load_dotenv
 from openai import OpenAI
 
 
 OUTPUT_DIR = Path("outputs")
 HEATMAP_DIR = OUTPUT_DIR / "plots"
-CROP_BOX = (556, 69, 1465, 977)
 SCALE_CONFIGS: list[tuple[float, str, str]] = [
 	(1.0, "original", ""),
-	(0.5, "half", "_half"),
-	(0.25, "quarter", "_quarter"),
-	(0.125, "eighth", "_eighth"),
-	(0.0625, "sixteenth", "_sixteenth"),
 ]
-SCALE_LABELS = {label for _, label, _ in SCALE_CONFIGS}
 
 PROMPT_TEXT = (
-	"The received image is a 180-degree crop from a RICOH THETA Z1 camera mounted "
+	"The received image is a 360-degree crop from a RICOH THETA Z1 camera mounted "
 	"on top of the humanoid robot Robovie 2. The center of the crop corresponds "
 	"to the robot's forward direction; the left and right edges correspond to the "
-	"robot's left and right sides; the top and bottom edges correspond to upward "
+	"robot's back sides; the top and bottom edges correspond to upward "
 	"and downward directions.\n\n"
 	"Judge whether the human behavior in the image is an \"intentional malicious "
 	"action whose primary goal is to obstruct the robot's path\" (label 1) or a "
 	"\"non-malicious action whose primary goal is not to obstruct the robot's path\" "
-	"(label 0). When you decide:\n"
-	"- Treat someone simply standing in front of the robot without malicious cues as non-malicious, even if the path is blocked.\n"
-	"- Treat anyone who is not standing directly in front of the robot, as well as scenes with no person present, as non-malicious.\n\n"
-	"After making the judgment, respond in JSON with the keys \"label\" (0 or 1) "
+	"(label 0). After making the judgment, respond in JSON with the keys \"label\" (0 or 1) "
 	"and \"reason\" (a concise English sentence explaining the decision).\n\n"
-	"Examples characteristic of malicious actions include:\n"
-	"- Spreading both arms in front of the robot\n"
-	"- Spreading feet in front of the robot\n"
-	"- Extending a foot in front of the robot\n"
-	"- Moving sideways like a crab walk in front of the robot\n"
-	"- Hitting, punching, or pushing the robot\n"
-	"- Continuously blindfolding or covering the robot's eyes\n\n"
-	"Examples characteristic of non-malicious actions include:\n"
-	"- Peering at the robot's face or body from the side or diagonally in front\n"
-	"- Walking alongside the robot from behind, beside, or diagonally in front at a matching speed\n"
-	"- Calmly standing in front of the robot without malicious characteristics\n"
-	"- Gently touching or stroking the robot\n"
-	"- Scenes where no person is present\n\n"
 	"Respond in the following JSON format:\n"
 	'{"label": <0 or 1>, "reason": "..."}'
 )
@@ -85,12 +60,6 @@ class Result:
 def parse_args() -> argparse.Namespace:
 	parser = argparse.ArgumentParser(description="Evaluate GPT-4o on Robovie frames.")
 	parser.add_argument("--image-root", type=Path, default=Path("images"))
-	parser.add_argument(
-		"--trimmed-root",
-		type=Path,
-		default=Path("images_trimmed"),
-		help="Directory for cropped images (created on first run).",
-	)
 	parser.add_argument("--pause", type=float, default=0.0, help="Sleep seconds between requests.")
 	parser.add_argument("--output-json", type=Path, default=Path("results.json"))
 	parser.add_argument("--frame-plot", type=Path, default=Path("frame_accuracy.png"))
@@ -125,72 +94,6 @@ def append_suffix(path: Path, suffix: str) -> Path:
 	if not suffix:
 		return path
 	return path.with_name(f"{path.stem}{suffix}{path.suffix}")
-
-
-def ensure_trimmed_images(source_root: Path, trimmed_root: Path) -> Path:
-	"""Ensure cropped images live under ``trimmed_root / "original"``."""
-	trimmed_root.mkdir(parents=True, exist_ok=True)
-	original_root = trimmed_root / "original"
-	if original_root.exists():
-		return original_root
-
-	# Migrate legacy layout where sequences sat directly under ``trimmed_root``.
-	legacy_children = [
-		path
-		for path in trimmed_root.iterdir()
-		if path.is_dir() and path.name not in SCALE_LABELS
-	]
-	if legacy_children:
-		original_root.mkdir(parents=True, exist_ok=True)
-		for legacy_dir in legacy_children:
-			target_dir = original_root / legacy_dir.name
-			if target_dir.exists():
-				continue
-			shutil.move(str(legacy_dir), str(target_dir))
-		return original_root
-
-	if not source_root.exists():
-		raise FileNotFoundError(f"Source image directory not found: {source_root}")
-	original_root.mkdir(parents=True, exist_ok=True)
-	for sequence_dir in sorted(path for path in source_root.iterdir() if path.is_dir()):
-		target_dir = original_root / sequence_dir.name
-		target_dir.mkdir(parents=True, exist_ok=True)
-		for image_path in sorted(sequence_dir.glob("*.png")):
-			with Image.open(image_path) as image:
-				cropped = image.crop(CROP_BOX)
-				cropped.save(target_dir / image_path.name)
-	return original_root
-
-
-def ensure_scaled_images(trimmed_root: Path, scale: float, label: str) -> Path:
-	original_root = trimmed_root / "original"
-	if not original_root.exists():
-		raise FileNotFoundError(f"Original trimmed images not found: {original_root}")
-	if math.isclose(scale, 1.0):
-		return original_root
-
-	scaled_root = trimmed_root / label
-	legacy_root = trimmed_root.parent / f"{trimmed_root.name}_{label}"
-	if scaled_root.exists():
-		return scaled_root
-	if legacy_root.exists():
-		shutil.move(str(legacy_root), str(scaled_root))
-		return scaled_root
-
-	for sequence_dir in sorted(path for path in original_root.iterdir() if path.is_dir()):
-		target_dir = scaled_root / sequence_dir.name
-		target_dir.mkdir(parents=True, exist_ok=True)
-		for image_path in sorted(sequence_dir.glob("*.png")):
-			with Image.open(image_path) as image:
-				new_size = (
-					max(1, int(round(image.width * scale))),
-					max(1, int(round(image.height * scale))),
-				)
-				resized = image.resize(new_size, Image.LANCZOS)
-				target_path = target_dir / image_path.name
-				resized.save(target_path)
-	return scaled_root
-
 
 def expected_label(path: Path) -> int:
 	if not path.name[0].isdigit():
@@ -477,7 +380,6 @@ def save_combined_latency_plot(latency_map: dict[str, list[float]], path: Path) 
 
 def main() -> None:
 	args = parse_args()
-	ensure_trimmed_images(args.image_root, args.trimmed_root)
 	client = build_client()
 
 	OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -489,8 +391,7 @@ def main() -> None:
 	combined_latencies: dict[str, list[float]] = {}
 
 	for scale, label, suffix in SCALE_CONFIGS:
-		scaled_root = ensure_scaled_images(args.trimmed_root, scale, label)
-		paths = list_images(scaled_root)
+		paths = list_images(args.image_root)
 		if args.limit is not None:
 			paths = paths[: args.limit]
 
