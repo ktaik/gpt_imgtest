@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import base64
 import json
 import math
@@ -17,7 +18,8 @@ import statistics
 import shutil
 
 import matplotlib.pyplot as plt
-from matplotlib.ticker import MaxNLocator, MultipleLocator
+from matplotlib.ticker import MaxNLocator
+import numpy as np
 from PIL import Image
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -27,13 +29,25 @@ OUTPUT_DIR = Path("outputs")
 HEATMAP_DIR = OUTPUT_DIR / "plots"
 CROP_BOX = (556, 69, 1465, 977)
 SCALE_CONFIGS: list[tuple[float, str, str]] = [
-	(1.0, "original", ""),
-	(0.5, "half", "_half"),
+	(1.0, "original", "_original"),
 	(0.25, "quarter", "_quarter"),
-	(0.125, "eighth", "_eighth"),
-	(0.0625, "sixteenth", "_sixteenth"),
 ]
 SCALE_LABELS = {label for _, label, _ in SCALE_CONFIGS}
+REQUEST_INTERVAL = 1.0
+
+HMM_TRANSITION = np.array(
+	[
+		[0.95, 0.05],
+		[0.10, 0.90],
+	]
+)
+HMM_EMISSION = np.array(
+	[
+		[0.9365, 0.06349],
+		[0.7196, 0.2804],
+	]
+)
+HMM_PRIOR = np.array([0.7, 0.3])
 
 PROMPT_TEXT = (
 	"The received image is a 180-degree crop from a RICOH THETA Z1 camera mounted "
@@ -76,6 +90,9 @@ class Result:
 	reason: Optional[str]
 	raw: str
 	latency: float
+	received_order: int
+	hmm_prob: Optional[float] = None
+	hmm_label: Optional[int] = None
 
 	@property
 	def correct(self) -> bool:
@@ -125,6 +142,23 @@ def append_suffix(path: Path, suffix: str) -> Path:
 	if not suffix:
 		return path
 	return path.with_name(f"{path.stem}{suffix}{path.suffix}")
+
+
+def reset_output_dir(root: Path) -> None:
+	if root.exists():
+		shutil.rmtree(root)
+	root.mkdir(parents=True, exist_ok=True)
+
+
+def trial_key(path: Path) -> tuple[str, str]:
+	participant = path.parent.name
+	prefix = path.stem.split("_")[0]
+	return participant, prefix
+
+
+def result_trial_id(result: Result) -> str:
+	participant, prefix = trial_key(result.path)
+	return f"{participant}-{prefix}"
 
 
 def ensure_trimmed_images(source_root: Path, trimmed_root: Path) -> Path:
@@ -190,6 +224,40 @@ def ensure_scaled_images(trimmed_root: Path, scale: float, label: str) -> Path:
 				target_path = target_dir / image_path.name
 				resized.save(target_path)
 	return scaled_root
+
+
+class OnlineHMMFilter:
+	def __init__(self, transition: np.ndarray, emission: np.ndarray, prior: np.ndarray) -> None:
+		self.transition = transition.astype(float)
+		self.emission = emission.astype(float)
+		prior = prior.astype(float)
+		if prior.sum() == 0:
+			raise ValueError("HMM prior must sum to a non-zero value")
+		self.initial = prior / prior.sum()
+		self.belief = self.initial.copy()
+
+	def reset(self) -> None:
+		self.belief = self.initial.copy()
+
+	def update(self, observation: Optional[int]) -> np.ndarray:
+		pred = self.transition.T @ self.belief
+		sum_pred = pred.sum()
+		if sum_pred > 0:
+			pred /= sum_pred
+		else:
+			pred = self.initial.copy()
+
+		if observation in (0, 1):
+			emission = self.emission[:, observation]
+			posterior = emission * pred
+			sum_post = posterior.sum()
+			if sum_post > 0:
+				self.belief = posterior / sum_post
+			else:
+				self.belief = self.initial.copy()
+		else:
+			self.belief = pred
+		return self.belief
 
 
 def expected_label(path: Path) -> int:
@@ -263,25 +331,110 @@ def parse_response(raw: str) -> tuple[Optional[int], Optional[str]]:
 	return None, reason if isinstance(reason, str) else None
 
 
-def iterate_results(client: OpenAI, paths: list[Path], pause: float) -> list[Result]:
-	results: list[Result] = []
-	for idx, path in enumerate(paths, start=1):
-		truth = expected_label(path)
-		frame = frame_index(path)
-		raw, latency = safe_predict(client, path)
-		pred, reason = parse_response(raw)
+async def request_single(client: OpenAI, path: Path) -> tuple[Path, str, float]:
+	raw, latency = await asyncio.to_thread(safe_predict, client, path)
+	return path, raw, latency
 
-		results.append(
-			Result(path=path, frame=frame, true=truth, predicted=pred, reason=reason, raw=raw, latency=latency)
-		)
 
-		print(
-			f"[{idx}] {path} -> truth {truth}, predicted {pred}, correct {pred == truth}, "
-			f"latency {latency:.2f}s"
+def sort_paths_by_frame(paths: list[Path]) -> list[Path]:
+	return sorted(paths, key=frame_index)
+
+
+def build_action_groups(paths: list[Path]) -> list[tuple[str, list[Path]]]:
+	groups: dict[tuple[str, str], list[Path]] = defaultdict(list)
+	for path in paths:
+		groups[trial_key(path)].append(path)
+	action_groups: list[tuple[str, list[Path]]] = []
+	for key in sorted(groups.keys()):
+		participant, prefix = key
+		trial_id = f"{participant}-{prefix}"
+		ordered_paths = sort_paths_by_frame(groups[key])
+		action_groups.append((trial_id, ordered_paths))
+	return action_groups
+
+
+async def process_action(
+	client: OpenAI,
+	paths: list[Path],
+	interval: float,
+	starting_index: int,
+) -> tuple[list[Result], list[float], int]:
+	if not paths:
+		return [], [], starting_index
+
+	interval = max(interval, REQUEST_INTERVAL)
+	send_order: dict[Path, int] = {}
+	tasks: list[asyncio.Task] = []
+	completion_data: dict[Path, Result] = {}
+	started = False
+	received_counter = starting_index
+
+	def on_done(task: asyncio.Task, *, path: Path, send_index: int) -> None:
+		nonlocal received_counter
+		try:
+			_path, raw, latency = task.result()
+			pred, reason = parse_response(raw)
+			truth = expected_label(path)
+			frame = frame_index(path)
+			received_counter += 1
+			result = Result(
+				path=path,
+				frame=frame,
+				true=truth,
+				predicted=pred,
+				reason=reason,
+				raw=raw,
+				latency=latency,
+				received_order=received_counter,
+			)
+			completion_data[path] = result
+			print(
+				f"[sent {send_index} | recv {received_counter}] {path} -> truth {truth}, "
+				f"predicted {pred}, correct {result.correct}, latency {latency:.2f}s",
+				flush=True,
+			)
+		except Exception as e:
+			print(f"[error] {path.name}: {e}", flush=True)
+
+	for idx, path in enumerate(paths):
+		send_index = starting_index + idx + 1
+		send_order[path] = send_index
+		t = asyncio.create_task(request_single(client, path))
+		t.add_done_callback(lambda task, p=path, s=send_index: on_done(task, path=p, send_index=s))
+		tasks.append(t)
+		if not started:
+			print("スタート", flush=True)
+			started = True
+		if idx < len(paths) - 1:
+			await asyncio.sleep(interval)
+
+	# Ensure all tasks have finished (prints already happened on completion)
+	await asyncio.gather(*tasks, return_exceptions=True)
+
+	# Align outputs to original order for downstream processing
+	results = [completion_data[path] for path in paths if path in completion_data]
+	latencies = [completion_data[path].latency for path in paths if path in completion_data]
+	return results, latencies, received_counter
+
+
+async def process_scale_actions(
+	client: OpenAI,
+	action_groups: list[tuple[str, list[Path]]],
+	interval: float,
+) -> tuple[list[Result], dict[str, list[float]]]:
+	all_results: list[Result] = []
+	latency_map: dict[str, list[float]] = {}
+	received_index = 0
+	for trial_id, paths in action_groups:
+		results, latencies, received_index = await process_action(
+			client,
+			paths,
+			interval,
+			received_index,
 		)
-		if pause:
-			time.sleep(pause)
-	return results
+		all_results.extend(results)
+		latency_map[trial_id] = latencies
+	return all_results, latency_map
 
 
 def summarise(
@@ -327,6 +480,70 @@ def summarise(
 	return correct_total / total, per_label_accuracy, frame_accuracy, frame_label_accuracy
 
 
+def apply_hmm_filter(results: list[Result]) -> None:
+	groups: dict[str, list[Result]] = defaultdict(list)
+	for result in results:
+		groups[result_trial_id(result)].append(result)
+
+	for group in groups.values():
+		group.sort(key=lambda item: item.received_order)
+		filter_ = OnlineHMMFilter(HMM_TRANSITION, HMM_EMISSION, HMM_PRIOR)
+		filter_.reset()
+		max_frame_seen = -1
+		for result in group:
+			if result.frame <= max_frame_seen:
+				result.hmm_prob = None
+				result.hmm_label = None
+				continue
+			belief = filter_.update(result.predicted if result.predicted in (0, 1) else None)
+			result.hmm_prob = float(belief[1])
+			result.hmm_label = 1 if result.hmm_prob >= 0.5 else 0
+			max_frame_seen = result.frame
+
+
+def summarise_hmm(
+	results: list[Result],
+) -> tuple[float, dict[int, float], dict[int, float], dict[int, dict[int, float]]]:
+	filtered = [result for result in results if result.hmm_label is not None]
+	total = len(filtered)
+	if total == 0:
+		return 0.0, {}, {}, {}
+
+	correct_total = sum(result.hmm_label == result.true for result in filtered)
+	per_label_totals: Counter[int] = Counter(result.true for result in filtered)
+	per_label_correct: Counter[int] = Counter(result.true for result in filtered if result.hmm_label == result.true)
+
+	per_label_accuracy = {
+		label: per_label_correct[label] / count if count else 0.0
+		for label, count in per_label_totals.items()
+	}
+
+	per_frame_flags: defaultdict[int, list[bool]] = defaultdict(list)
+	per_frame_label_totals: defaultdict[int, Counter[int]] = defaultdict(Counter)
+	per_frame_label_correct: defaultdict[int, Counter[int]] = defaultdict(Counter)
+	for result in filtered:
+		per_frame_flags[result.frame].append(result.hmm_label == result.true)
+		per_frame_label_totals[result.frame][result.true] += 1
+		if result.hmm_label == result.true:
+			per_frame_label_correct[result.frame][result.true] += 1
+
+	frame_accuracy = {
+		frame: sum(flags) / len(flags) if flags else 0.0
+		for frame, flags in sorted(per_frame_flags.items())
+	}
+
+	frame_label_accuracy: dict[int, dict[int, float]] = {}
+	for frame in sorted(per_frame_label_totals.keys()):
+		label_totals = per_frame_label_totals[frame]
+		label_correct = per_frame_label_correct[frame]
+		frame_label_accuracy[frame] = {
+			label: (label_correct[label] / total if total else 0.0)
+			for label, total in label_totals.items()
+		}
+
+	return correct_total / total, per_label_accuracy, frame_accuracy, frame_label_accuracy
+
+
 def save_results(results: list[Result], path: Path) -> None:
 	serialised = [
 		{
@@ -338,6 +555,9 @@ def save_results(results: list[Result], path: Path) -> None:
 			"raw_response": r.raw,
 			"correct": r.correct,
 			"response_time_seconds": r.latency,
+			"response_order": r.received_order,
+			"hmm_probability_malicious": r.hmm_prob,
+			"hmm_filtered_label": r.hmm_label,
 		}
 		for r in results
 	]
@@ -382,11 +602,6 @@ def save_label_heatmaps(results: list[Result], output_dir: Path) -> list[Path]:
 	if not results:
 		return []
 
-	def trial_id(result: Result) -> str:
-		prefix = result.path.stem.split("_")[0]
-		participant = result.path.parent.name
-		return f"{participant}-{prefix}"
-
 	frames = sorted({result.frame for result in results})
 	saved_paths: list[Path] = []
 	for label in sorted({result.true for result in results}):
@@ -394,9 +609,9 @@ def save_label_heatmaps(results: list[Result], output_dir: Path) -> list[Path]:
 		if not label_results:
 			continue
 
-		trials = sorted({trial_id(result) for result in label_results})
+		trials = sorted({result_trial_id(result) for result in label_results})
 		value_map = {
-			(trial_id(result), result.frame): (
+			(result_trial_id(result), result.frame): (
 				float(result.predicted) if result.predicted is not None else math.nan
 			)
 			for result in label_results
@@ -421,6 +636,51 @@ def save_label_heatmaps(results: list[Result], output_dir: Path) -> list[Path]:
 		fig.colorbar(im, ax=ax, label="Predicted label")
 		fig.tight_layout()
 		output_path = output_dir / f"label_{label}_heatmap.png"
+		fig.savefig(output_path, dpi=200)
+		plt.close(fig)
+		saved_paths.append(output_path)
+
+	return saved_paths
+
+
+def save_hmm_heatmaps(results: list[Result], output_dir: Path) -> list[Path]:
+	output_dir.mkdir(parents=True, exist_ok=True)
+	filtered = [result for result in results if result.hmm_prob is not None]
+	if not filtered:
+		return []
+
+	frames = sorted({result.frame for result in filtered})
+	saved_paths: list[Path] = []
+	for label in sorted({result.true for result in filtered}):
+		label_results = [result for result in filtered if result.true == label]
+		if not label_results:
+			continue
+
+		trials = sorted({result_trial_id(result) for result in label_results})
+		value_map = {
+			(result_trial_id(result), result.frame): float(result.hmm_prob)
+			for result in label_results
+		}
+
+		matrix: list[list[float]] = []
+		for trial in trials:
+			row: list[float] = []
+			for frame in frames:
+				row.append(value_map.get((trial, frame), math.nan))
+			matrix.append(row)
+
+		fig, ax = plt.subplots(figsize=(12, max(3, len(trials) * 0.4)))
+		im = ax.imshow(matrix, aspect="auto", interpolation="nearest", vmin=0, vmax=1, cmap="magma")
+		ax.set_xlabel("Frame index")
+		ax.set_ylabel("Trial")
+		ax.set_title(f"HMM filtered P(malicious) (true label {label})")
+		ax.set_xticks(range(len(frames)))
+		ax.set_xticklabels([f"{frame:02d}" for frame in frames], rotation=45)
+		ax.set_yticks(range(len(trials)))
+		ax.set_yticklabels(trials)
+		fig.colorbar(im, ax=ax, label="P(malicious)")
+		fig.tight_layout()
+		output_path = output_dir / f"label_{label}_hmm_heatmap.png"
 		fig.savefig(output_path, dpi=200)
 		plt.close(fig)
 		saved_paths.append(output_path)
@@ -477,10 +737,9 @@ def save_combined_latency_plot(latency_map: dict[str, list[float]], path: Path) 
 
 def main() -> None:
 	args = parse_args()
+	reset_output_dir(OUTPUT_DIR)
 	ensure_trimmed_images(args.image_root, args.trimmed_root)
 	client = build_client()
-
-	OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 	base_results = OUTPUT_DIR / args.output_json.name
 	base_frame_plot = OUTPUT_DIR / args.frame_plot.name
 	base_latency_plot = OUTPUT_DIR / args.latency_plot.name
@@ -493,11 +752,14 @@ def main() -> None:
 		paths = list_images(scaled_root)
 		if args.limit is not None:
 			paths = paths[: args.limit]
-
+		action_groups = build_action_groups(paths)
 		print(f"\n=== Evaluation for {label} (scale ×{scale:.3f}) ===")
 		report_lines.append(f"=== Evaluation for {label} (scale ×{scale:.3f}) ===")
-		results = iterate_results(client, paths, pause=args.pause)
+		interval = max(REQUEST_INTERVAL, args.pause)
+		results, latency_map = asyncio.run(process_scale_actions(client, action_groups, interval))
+		apply_hmm_filter(results)
 		overall, per_label, frame_accuracy, frame_label_accuracy = summarise(results)
+		hmm_overall, hmm_per_label, hmm_frame_accuracy, hmm_frame_label_accuracy = summarise_hmm(results)
 
 		sum_correct = sum(r.correct for r in results)
 		total = len(results)
@@ -521,7 +783,28 @@ def main() -> None:
 				print(lbl_line)
 				report_lines.append(lbl_line)
 
-		latencies = [result.latency for result in results]
+		print("HMM filtered metrics:")
+		report_lines.append("HMM filtered metrics:")
+		print(f"  Overall: {hmm_overall:.3%}")
+		report_lines.append(f"  Overall: {hmm_overall:.3%}")
+		for lbl in sorted(hmm_per_label):
+			txt = f"  Label {lbl}: {hmm_per_label[lbl]:.3%}"
+			print(txt)
+			report_lines.append(txt)
+		print("  Frame accuracy:")
+		report_lines.append("  Frame accuracy:")
+		for frame in sorted(hmm_frame_accuracy):
+			accuracy = hmm_frame_accuracy[frame]
+			frame_line = f"    Frame {frame:02d}: {accuracy:.3%}"
+			print(frame_line)
+			report_lines.append(frame_line)
+			label_breakdown = hmm_frame_label_accuracy.get(frame, {})
+			for lbl in sorted(label_breakdown):
+				lbl_line = f"      Label {lbl}: {label_breakdown[lbl]:.3%}"
+				print(lbl_line)
+				report_lines.append(lbl_line)
+
+		latencies = [lat for lat_list in latency_map.values() for lat in lat_list]
 		if latencies:
 			average_latency = statistics.mean(latencies)
 			latency_line = f"Average response time: {average_latency:.2f}s over {len(latencies)} requests"
@@ -533,18 +816,29 @@ def main() -> None:
 
 		results_path = append_suffix(base_results, suffix)
 		frame_plot_path = append_suffix(base_frame_plot, suffix)
+		hmm_frame_plot_path = append_suffix(base_frame_plot, suffix + "_hmm")
 		latency_plot_path = append_suffix(base_latency_plot, suffix)
 		heatmap_dir = HEATMAP_DIR / label
+		hmm_heatmap_dir = heatmap_dir / "hmm"
 
 		save_results(results, results_path)
 		save_frame_plot(frame_accuracy, frame_label_accuracy, frame_plot_path)
+		hmm_frame_plot_generated = bool(hmm_frame_accuracy)
+		save_frame_plot(hmm_frame_accuracy, hmm_frame_label_accuracy, hmm_frame_plot_path)
 		save_latency_plot(latencies, latency_plot_path, title=f"Response times ({label})")
 		heatmap_paths = save_label_heatmaps(results, heatmap_dir)
+		hmm_heatmap_paths = save_hmm_heatmaps(results, hmm_heatmap_dir)
 
 		saved_lines = [
 			f"Saved details to {results_path}",
 			f"Saved frame plot to {frame_plot_path}",
 		]
+		if hmm_frame_plot_generated:
+			saved_lines.append(f"Saved HMM frame plot to {hmm_frame_plot_path}")
+		else:
+			hmm_plot_msg = "HMM frame plot not generated (no filtered data)."
+			print(hmm_plot_msg)
+			report_lines.append(hmm_plot_msg)
 		for message in saved_lines:
 			print(message)
 			report_lines.append(message)
@@ -565,6 +859,15 @@ def main() -> None:
 			no_heat = "No heatmaps generated (no results)."
 			print(no_heat)
 			report_lines.append(no_heat)
+		if hmm_heatmap_paths:
+			for path in hmm_heatmap_paths:
+				heat_line = f"Saved HMM heatmap to {path}"
+				print(heat_line)
+				report_lines.append(heat_line)
+		else:
+			no_hmm_heat = "HMM heatmaps not generated (no results)."
+			print(no_hmm_heat)
+			report_lines.append(no_hmm_heat)
 		report_lines.append("")
 
 	combined_path = base_latency_plot.with_name(f"{base_latency_plot.stem}_combined{base_latency_plot.suffix}")
