@@ -16,7 +16,10 @@ from typing import Optional
 
 import statistics
 import shutil
+import subprocess
 
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.ticker import MaxNLocator
 import numpy as np
@@ -160,6 +163,70 @@ def trial_key(path: Path) -> tuple[str, str]:
 def result_trial_id(result: Result) -> str:
 	participant, prefix = trial_key(result.path)
 	return f"{participant}-{prefix}"
+
+
+def generate_interval_images_from_videos(
+	videos_root: Path,
+	images_root: Path,
+	interval_sec: float,
+	max_seconds: float = 19.0,
+) -> None:
+	"""Extract frames from videos into images_root at the given interval.
+
+	Layout produced:
+	  images_root/<participant>/<delta>_<frameIndex>.png
+
+	- Starts at t=0.0s, then every interval up to and including max_seconds
+	  (e.g., 1.0s interval -> 20 frames: 0..19s).
+	- "delta" is taken from the mp4 filename stem (1..6); its偶奇でラベル判定は従来どおり。
+	- frameIndex is 1-based and zero-padded to the minimum width for total frames.
+	- Requires ffmpeg to be available on PATH.
+	"""
+	if not videos_root.exists():
+		raise FileNotFoundError(f"Videos directory not found: {videos_root}")
+
+	ffmpeg_path = shutil.which("ffmpeg")
+	if not ffmpeg_path:
+		raise EnvironmentError("ffmpeg not found. Please install ffmpeg and ensure it's on PATH.")
+
+	# Recreate target tree for this interval
+	if images_root.exists():
+		shutil.rmtree(images_root)
+	images_root.mkdir(parents=True, exist_ok=True)
+
+	# Determine frame count and padding width
+	if interval_sec <= 0:
+		raise ValueError("interval_sec must be positive")
+	total_frames = int(math.floor(max_seconds / interval_sec)) + 1
+	pad_width = max(2, len(str(total_frames)))
+
+	participants = [d for d in sorted(videos_root.iterdir()) if d.is_dir()]
+	for participant_dir in participants:
+		out_participant = images_root / participant_dir.name
+		out_participant.mkdir(parents=True, exist_ok=True)
+		for video_path in sorted(participant_dir.glob("*.mp4")):
+			delta = video_path.stem
+			# Build all extraction times to keep count identical across videos
+			times = [round(k * interval_sec, 6) for k in range(total_frames)]
+			for idx, t in enumerate(times, start=1):
+				frame_name = f"{delta}_{idx:0{pad_width}d}.png"
+				output_path = out_participant / frame_name
+				# ffmpeg: precise single-frame extraction at timestamp t
+				cmd = [
+					ffmpeg_path,
+					"-hide_banner",
+					"-loglevel", "error",
+					"-ss", f"{t:.6f}",
+					"-i", str(video_path),
+					"-frames:v", "1",
+					"-y",
+					str(output_path),
+				]
+				res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+				if res.returncode != 0:
+					raise RuntimeError(
+						f"ffmpeg failed for {video_path} at t={t:.6f}s: {res.stderr.decode('utf-8', 'ignore')}"
+					)
 
 
 def ensure_trimmed_images(source_root: Path, trimmed_root: Path) -> Path:
@@ -739,7 +806,6 @@ def save_combined_latency_plot(latency_map: dict[str, list[float]], path: Path) 
 def main() -> None:
 	args = parse_args()
 	reset_output_dir(OUTPUT_DIR)
-	ensure_trimmed_images(args.image_root, args.trimmed_root)
 	client = build_client()
 	for run_interval in RUN_INTERVALS:
 		interval_label = f"interval_{int(run_interval * 1000):04d}ms"
@@ -756,8 +822,17 @@ def main() -> None:
 		print(f"\n=== Evaluation for interval {run_interval:.3f}s ({interval_label}) ===")
 		report_lines.append(f"=== Evaluation for interval {run_interval:.3f}s ({interval_label}) ===")
 
+		# 1) Generate frames for this interval under images/<interval_label>/
+		videos_root = Path("videos")
+		per_run_images_root = Path("images") / interval_label
+		generate_interval_images_from_videos(videos_root, per_run_images_root, run_interval, max_seconds=19.0)
+
+		# 2) Trim/crop into a per-interval trimmed root to keep runs isolated
+		per_run_trimmed_root = args.trimmed_root / interval_label
+		ensure_trimmed_images(per_run_images_root, per_run_trimmed_root)
+
 		for scale, label, suffix in SCALE_CONFIGS:
-			scaled_root = ensure_scaled_images(args.trimmed_root, scale, label)
+			scaled_root = ensure_scaled_images(per_run_trimmed_root, scale, label)
 			paths = list_images(scaled_root)
 			if args.limit is not None:
 				paths = paths[: args.limit]
