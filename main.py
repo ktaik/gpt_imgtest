@@ -26,14 +26,15 @@ from openai import OpenAI
 
 
 OUTPUT_DIR = Path("outputs")
-HEATMAP_DIR = OUTPUT_DIR / "plots"
 CROP_BOX = (556, 69, 1465, 977)
 SCALE_CONFIGS: list[tuple[float, str, str]] = [
 	(1.0, "original", "_original"),
 	(0.25, "quarter", "_quarter"),
+	(0.125, "eighth", "_eighth"),
 ]
 SCALE_LABELS = {label for _, label, _ in SCALE_CONFIGS}
-REQUEST_INTERVAL = 1.0
+REQUEST_INTERVAL = 0.125
+RUN_INTERVALS: list[float] = [0.125, 0.25, 0.5, 1.0]
 
 HMM_TRANSITION = np.array(
 	[
@@ -740,152 +741,160 @@ def main() -> None:
 	reset_output_dir(OUTPUT_DIR)
 	ensure_trimmed_images(args.image_root, args.trimmed_root)
 	client = build_client()
-	base_results = OUTPUT_DIR / args.output_json.name
-	base_frame_plot = OUTPUT_DIR / args.frame_plot.name
-	base_latency_plot = OUTPUT_DIR / args.latency_plot.name
-	report_path = OUTPUT_DIR / "summary.txt"
-	report_lines: list[str] = []
-	combined_latencies: dict[str, list[float]] = {}
+	for run_interval in RUN_INTERVALS:
+		interval_label = f"interval_{int(run_interval * 1000):04d}ms"
+		run_output_root = OUTPUT_DIR / interval_label
+		run_output_root.mkdir(parents=True, exist_ok=True)
+		base_results = run_output_root / args.output_json.name
+		base_frame_plot = run_output_root / args.frame_plot.name
+		base_latency_plot = run_output_root / args.latency_plot.name
+		report_path = run_output_root / "summary.txt"
+		heatmap_root = run_output_root / "plots"
+		report_lines: list[str] = []
+		combined_latencies: dict[str, list[float]] = {}
 
-	for scale, label, suffix in SCALE_CONFIGS:
-		scaled_root = ensure_scaled_images(args.trimmed_root, scale, label)
-		paths = list_images(scaled_root)
-		if args.limit is not None:
-			paths = paths[: args.limit]
-		action_groups = build_action_groups(paths)
-		print(f"\n=== Evaluation for {label} (scale ×{scale:.3f}) ===")
-		report_lines.append(f"=== Evaluation for {label} (scale ×{scale:.3f}) ===")
-		interval = max(REQUEST_INTERVAL, args.pause)
-		results, latency_map = asyncio.run(process_scale_actions(client, action_groups, interval))
-		apply_hmm_filter(results)
-		overall, per_label, frame_accuracy, frame_label_accuracy = summarise(results)
-		hmm_overall, hmm_per_label, hmm_frame_accuracy, hmm_frame_label_accuracy = summarise_hmm(results)
+		print(f"\n=== Evaluation for interval {run_interval:.3f}s ({interval_label}) ===")
+		report_lines.append(f"=== Evaluation for interval {run_interval:.3f}s ({interval_label}) ===")
 
-		sum_correct = sum(r.correct for r in results)
-		total = len(results)
-		print(f"Overall: {overall:.3%} ({sum_correct}/{total})")
-		report_lines.append(f"Overall: {overall:.3%} ({sum_correct}/{total})")
-		for lbl in sorted(per_label):
-			txt = f"Label {lbl}: {per_label[lbl]:.3%}"
-			print(txt)
-			report_lines.append(txt)
+		for scale, label, suffix in SCALE_CONFIGS:
+			scaled_root = ensure_scaled_images(args.trimmed_root, scale, label)
+			paths = list_images(scaled_root)
+			if args.limit is not None:
+				paths = paths[: args.limit]
+			action_groups = build_action_groups(paths)
+			print(f"\n=== Evaluation for {label} (scale ×{scale:.3f}) ===")
+			report_lines.append(f"=== Evaluation for {label} (scale ×{scale:.3f}) ===")
+			interval = max(run_interval, REQUEST_INTERVAL)
+			results, latency_map = asyncio.run(process_scale_actions(client, action_groups, interval))
+			apply_hmm_filter(results)
+			overall, per_label, frame_accuracy, frame_label_accuracy = summarise(results)
+			hmm_overall, hmm_per_label, hmm_frame_accuracy, hmm_frame_label_accuracy = summarise_hmm(results)
 
-		print("Frame accuracy:")
-		report_lines.append("Frame accuracy:")
-		for frame in sorted(frame_accuracy):
-			accuracy = frame_accuracy[frame]
-			frame_line = f"  Frame {frame:02d}: {accuracy:.3%}"
-			print(frame_line)
-			report_lines.append(frame_line)
-			label_breakdown = frame_label_accuracy.get(frame, {})
-			for lbl in sorted(label_breakdown):
-				lbl_line = f"    Label {lbl}: {label_breakdown[lbl]:.3%}"
-				print(lbl_line)
-				report_lines.append(lbl_line)
+			sum_correct = sum(r.correct for r in results)
+			total = len(results)
+			print(f"Overall: {overall:.3%} ({sum_correct}/{total})")
+			report_lines.append(f"Overall: {overall:.3%} ({sum_correct}/{total})")
+			for lbl in sorted(per_label):
+				txt = f"Label {lbl}: {per_label[lbl]:.3%}"
+				print(txt)
+				report_lines.append(txt)
 
-		print("HMM filtered metrics:")
-		report_lines.append("HMM filtered metrics:")
-		print(f"  Overall: {hmm_overall:.3%}")
-		report_lines.append(f"  Overall: {hmm_overall:.3%}")
-		for lbl in sorted(hmm_per_label):
-			txt = f"  Label {lbl}: {hmm_per_label[lbl]:.3%}"
-			print(txt)
-			report_lines.append(txt)
-		print("  Frame accuracy:")
-		report_lines.append("  Frame accuracy:")
-		for frame in sorted(hmm_frame_accuracy):
-			accuracy = hmm_frame_accuracy[frame]
-			frame_line = f"    Frame {frame:02d}: {accuracy:.3%}"
-			print(frame_line)
-			report_lines.append(frame_line)
-			label_breakdown = hmm_frame_label_accuracy.get(frame, {})
-			for lbl in sorted(label_breakdown):
-				lbl_line = f"      Label {lbl}: {label_breakdown[lbl]:.3%}"
-				print(lbl_line)
-				report_lines.append(lbl_line)
+			print("Frame accuracy:")
+			report_lines.append("Frame accuracy:")
+			for frame in sorted(frame_accuracy):
+				accuracy = frame_accuracy[frame]
+				frame_line = f"  Frame {frame:02d}: {accuracy:.3%}"
+				print(frame_line)
+				report_lines.append(frame_line)
+				label_breakdown = frame_label_accuracy.get(frame, {})
+				for lbl in sorted(label_breakdown):
+					lbl_line = f"    Label {lbl}: {label_breakdown[lbl]:.3%}"
+					print(lbl_line)
+					report_lines.append(lbl_line)
 
-		latencies = [lat for lat_list in latency_map.values() for lat in lat_list]
-		if latencies:
-			average_latency = statistics.mean(latencies)
-			latency_line = f"Average response time: {average_latency:.2f}s over {len(latencies)} requests"
+			print("HMM filtered metrics:")
+			report_lines.append("HMM filtered metrics:")
+			print(f"  Overall: {hmm_overall:.3%}")
+			report_lines.append(f"  Overall: {hmm_overall:.3%}")
+			for lbl in sorted(hmm_per_label):
+				txt = f"  Label {lbl}: {hmm_per_label[lbl]:.3%}"
+				print(txt)
+				report_lines.append(txt)
+			print("  Frame accuracy:")
+			report_lines.append("  Frame accuracy:")
+			for frame in sorted(hmm_frame_accuracy):
+				accuracy = hmm_frame_accuracy[frame]
+				frame_line = f"    Frame {frame:02d}: {accuracy:.3%}"
+				print(frame_line)
+				report_lines.append(frame_line)
+				label_breakdown = hmm_frame_label_accuracy.get(frame, {})
+				for lbl in sorted(label_breakdown):
+					lbl_line = f"      Label {lbl}: {label_breakdown[lbl]:.3%}"
+					print(lbl_line)
+					report_lines.append(lbl_line)
+
+			latencies = [lat for lat_list in latency_map.values() for lat in lat_list]
+			if latencies:
+				average_latency = statistics.mean(latencies)
+				latency_line = f"Average response time: {average_latency:.2f}s over {len(latencies)} requests"
+			else:
+				latency_line = "Average response time: n/a (no results)"
+			print(latency_line)
+			report_lines.append(latency_line)
+			combined_latencies[label] = latencies
+
+			results_path = append_suffix(base_results, suffix)
+			frame_plot_path = append_suffix(base_frame_plot, suffix)
+			hmm_frame_plot_path = append_suffix(base_frame_plot, suffix + "_hmm")
+			latency_plot_path = append_suffix(base_latency_plot, suffix)
+			heatmap_dir = heatmap_root / label
+			hmm_heatmap_dir = heatmap_dir / "hmm"
+
+			save_results(results, results_path)
+			save_frame_plot(frame_accuracy, frame_label_accuracy, frame_plot_path)
+			hmm_frame_plot_generated = bool(hmm_frame_accuracy)
+			save_frame_plot(hmm_frame_accuracy, hmm_frame_label_accuracy, hmm_frame_plot_path)
+			save_latency_plot(latencies, latency_plot_path, title=f"Response times ({label})")
+			heatmap_paths = save_label_heatmaps(results, heatmap_dir)
+			hmm_heatmap_paths = save_hmm_heatmaps(results, hmm_heatmap_dir)
+
+			saved_lines = [
+				f"Saved details to {results_path}",
+				f"Saved frame plot to {frame_plot_path}",
+			]
+			if hmm_frame_plot_generated:
+				saved_lines.append(f"Saved HMM frame plot to {hmm_frame_plot_path}")
+			else:
+				hmm_plot_msg = "HMM frame plot not generated (no filtered data)."
+				print(hmm_plot_msg)
+				report_lines.append(hmm_plot_msg)
+			for message in saved_lines:
+				print(message)
+				report_lines.append(message)
+			if latencies:
+				latency_save = f"Saved latency plot to {latency_plot_path}"
+				print(latency_save)
+				report_lines.append(latency_save)
+			else:
+				no_latency = "Latency plot not generated (no results)."
+				print(no_latency)
+				report_lines.append(no_latency)
+			if heatmap_paths:
+				for path in heatmap_paths:
+					heat_line = f"Saved label heatmap to {path}"
+					print(heat_line)
+					report_lines.append(heat_line)
+			else:
+				no_heat = "No heatmaps generated (no results)."
+				print(no_heat)
+				report_lines.append(no_heat)
+			if hmm_heatmap_paths:
+				for path in hmm_heatmap_paths:
+					heat_line = f"Saved HMM heatmap to {path}"
+					print(heat_line)
+					report_lines.append(heat_line)
+			else:
+				no_hmm_heat = "HMM heatmaps not generated (no results)."
+				print(no_hmm_heat)
+				report_lines.append(no_hmm_heat)
+			report_lines.append("")
+
+		combined_path = base_latency_plot.with_name(f"{base_latency_plot.stem}_combined{base_latency_plot.suffix}")
+		save_combined_latency_plot(combined_latencies, combined_path)
+		if any(latencies for latencies in combined_latencies.values()):
+			combined_msg = f"Saved combined latency plot to {combined_path}"
+			print(f"\n{combined_msg}")
+			report_lines.append(combined_msg)
 		else:
-			latency_line = "Average response time: n/a (no results)"
-		print(latency_line)
-		report_lines.append(latency_line)
-		combined_latencies[label] = latencies
+			no_combined = "Combined latency plot not generated (no results)."
+			print(f"\n{no_combined}")
+			report_lines.append(no_combined)
 
-		results_path = append_suffix(base_results, suffix)
-		frame_plot_path = append_suffix(base_frame_plot, suffix)
-		hmm_frame_plot_path = append_suffix(base_frame_plot, suffix + "_hmm")
-		latency_plot_path = append_suffix(base_latency_plot, suffix)
-		heatmap_dir = HEATMAP_DIR / label
-		hmm_heatmap_dir = heatmap_dir / "hmm"
-
-		save_results(results, results_path)
-		save_frame_plot(frame_accuracy, frame_label_accuracy, frame_plot_path)
-		hmm_frame_plot_generated = bool(hmm_frame_accuracy)
-		save_frame_plot(hmm_frame_accuracy, hmm_frame_label_accuracy, hmm_frame_plot_path)
-		save_latency_plot(latencies, latency_plot_path, title=f"Response times ({label})")
-		heatmap_paths = save_label_heatmaps(results, heatmap_dir)
-		hmm_heatmap_paths = save_hmm_heatmaps(results, hmm_heatmap_dir)
-
-		saved_lines = [
-			f"Saved details to {results_path}",
-			f"Saved frame plot to {frame_plot_path}",
-		]
-		if hmm_frame_plot_generated:
-			saved_lines.append(f"Saved HMM frame plot to {hmm_frame_plot_path}")
-		else:
-			hmm_plot_msg = "HMM frame plot not generated (no filtered data)."
-			print(hmm_plot_msg)
-			report_lines.append(hmm_plot_msg)
-		for message in saved_lines:
-			print(message)
-			report_lines.append(message)
-		if latencies:
-			latency_save = f"Saved latency plot to {latency_plot_path}"
-			print(latency_save)
-			report_lines.append(latency_save)
-		else:
-			no_latency = "Latency plot not generated (no results)."
-			print(no_latency)
-			report_lines.append(no_latency)
-		if heatmap_paths:
-			for path in heatmap_paths:
-				heat_line = f"Saved label heatmap to {path}"
-				print(heat_line)
-				report_lines.append(heat_line)
-		else:
-			no_heat = "No heatmaps generated (no results)."
-			print(no_heat)
-			report_lines.append(no_heat)
-		if hmm_heatmap_paths:
-			for path in hmm_heatmap_paths:
-				heat_line = f"Saved HMM heatmap to {path}"
-				print(heat_line)
-				report_lines.append(heat_line)
-		else:
-			no_hmm_heat = "HMM heatmaps not generated (no results)."
-			print(no_hmm_heat)
-			report_lines.append(no_hmm_heat)
 		report_lines.append("")
-
-	combined_path = base_latency_plot.with_name(f"{base_latency_plot.stem}_combined{base_latency_plot.suffix}")
-	save_combined_latency_plot(combined_latencies, combined_path)
-	if any(latencies for latencies in combined_latencies.values()):
-		combined_msg = f"Saved combined latency plot to {combined_path}"
-		print(f"\n{combined_msg}")
-		report_lines.append(combined_msg)
-	else:
-		no_combined = "Combined latency plot not generated (no results)."
-		print(f"\n{no_combined}")
-		report_lines.append(no_combined)
-
-	report_lines.append("")
-	summary_msg = f"Summary saved to {report_path}"
-	print(summary_msg)
-	report_lines.append(summary_msg)
-	report_path.write_text("\n".join(report_lines).strip() + "\n", encoding="utf-8")
+		summary_msg = f"Summary saved to {report_path}"
+		print(summary_msg)
+		report_lines.append(summary_msg)
+		report_path.write_text("\n".join(report_lines).strip() + "\n", encoding="utf-8")
 
 
 if __name__ == "__main__":
