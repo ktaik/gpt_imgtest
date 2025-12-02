@@ -1,4 +1,4 @@
-"""Submit Robovie camera frames to GPT-4o and collect accuracy metrics."""
+"""Use YOLO person crops before submitting Robovie frames to GPT-4o and collect accuracy metrics."""
 
 from __future__ import annotations
 
@@ -24,9 +24,16 @@ from PIL import Image
 from dotenv import load_dotenv
 from openai import OpenAI
 
+try:
+	from ultralytics import YOLO
+except ImportError as error:
+	raise ImportError(
+		"ultralytics is required for YOLO-based person cropping. Install via `pip install ultralytics`."
+	) from error
 
 OUTPUT_DIR = Path("outputs")
 HEATMAP_DIR = OUTPUT_DIR / "plots"
+CROP_OUTPUT_DIR = OUTPUT_DIR / "person_crops"
 CROP_BOX = (556, 69, 1465, 977)
 SCALE_CONFIGS: list[tuple[float, str, str]] = [
 	(1.0, "original", "_original"),
@@ -84,6 +91,7 @@ PROMPT_TEXT = (
 @dataclass
 class Result:
 	path: Path
+	cropped_path: Path
 	frame: int
 	true: int
 	predicted: Optional[int]
@@ -93,10 +101,23 @@ class Result:
 	received_order: int
 	hmm_prob: Optional[float] = None
 	hmm_label: Optional[int] = None
+	detection_latency: float = 0.0
+	gpt_latency: float = 0.0
 
 	@property
 	def correct(self) -> bool:
 		return self.predicted is not None and self.predicted == self.true
+
+
+@dataclass
+class CropResult:
+	image_path: Path
+	detection_latency: float
+	note: str
+	has_person: bool
+	skip_gpt: bool
+	has_person: bool
+	skip_gpt: bool
 
 
 def parse_args() -> argparse.Namespace:
@@ -118,6 +139,18 @@ def parse_args() -> argparse.Namespace:
 		help="Line plot of per-request response times.",
 	)
 	parser.add_argument("--limit", type=int, default=None, help="Send only the first N images.")
+	parser.add_argument(
+		"--yolo-model",
+		type=str,
+		default="yolov8n.pt",
+		help="YOLO model (small footprint recommended, default yolov8n.pt).",
+	)
+	parser.add_argument(
+		"--yolo-confidence",
+		type=float,
+		default=0.25,
+		help="Minimum confidence for person detections.",
+	)
 	return parser.parse_args()
 
 
@@ -221,9 +254,89 @@ def ensure_scaled_images(trimmed_root: Path, scale: float, label: str) -> Path:
 					max(1, int(round(image.height * scale))),
 				)
 				resized = image.resize(new_size, Image.LANCZOS)
-				target_path = target_dir / image_path.name
-				resized.save(target_path)
+			target_path = target_dir / image_path.name
+			resized.save(target_path)
 	return scaled_root
+
+
+class YoloPersonCropper:
+	def __init__(self, model_path: str, output_root: Path, confidence: float = 0.25) -> None:
+		self.model = YOLO(model_path)
+		self.output_root = output_root
+		self.confidence = confidence
+
+	def _pick_largest_person(self, results: list) -> Optional[tuple[float, float, float, float]]:
+		best: Optional[tuple[float, tuple[float, float, float, float]]] = None
+		for result in results:
+			if not getattr(result, "boxes", None):
+				continue
+			for box in result.boxes:
+				if box.conf is not None and float(box.conf[0]) < self.confidence:
+					continue
+				cls_id = int(box.cls[0]) if box.cls is not None else -1
+				if cls_id != 0:  # YOLO class 0 is "person"
+					continue
+				x1, y1, x2, y2 = map(float, box.xyxy[0])
+				area = max(0.0, x2 - x1) * max(0.0, y2 - y1)
+				if area <= 0:
+					continue
+				if best is None or area > best[0]:
+					best = (area, (x1, y1, x2, y2))
+		return best[1] if best else None
+
+	def crop_person(self, image_path: Path, scale_label: str) -> CropResult:
+		target_dir = self.output_root / scale_label / image_path.parent.name
+		target_dir.mkdir(parents=True, exist_ok=True)
+		target_path = target_dir / image_path.name
+
+		start = time.perf_counter()
+		try:
+			results = self.model.predict(
+				source=str(image_path),
+				verbose=False,
+				conf=self.confidence,
+				max_det=5,
+			)
+		except Exception as error:  # noqa: BLE001
+			shutil.copy(image_path, target_path)
+			detection_latency = time.perf_counter() - start
+			return CropResult(
+				target_path,
+				detection_latency,
+				f"yolo error, fallback to original ({error})",
+				has_person=False,
+				skip_gpt=False,
+			)
+		best_box = self._pick_largest_person(results)
+		with Image.open(image_path) as image:
+			if best_box is None:
+				shutil.copy(image_path, target_path)
+				detection_latency = time.perf_counter() - start
+				return CropResult(
+					target_path,
+					detection_latency,
+					"no person detected; using original and skipping GPT",
+					has_person=False,
+					skip_gpt=True,
+				)
+
+			x1, y1, x2, y2 = best_box
+			crop_box = (
+				max(0, int(math.floor(x1))),
+				max(0, int(math.floor(y1))),
+				min(image.width, int(math.ceil(x2))),
+				min(image.height, int(math.ceil(y2))),
+			)
+			cropped = image.crop(crop_box)
+			cropped.save(target_path)
+		detection_latency = time.perf_counter() - start
+		return CropResult(
+			target_path,
+			detection_latency,
+			"cropped largest person",
+			has_person=True,
+			skip_gpt=False,
+		)
 
 
 class OnlineHMMFilter:
@@ -353,11 +466,29 @@ def build_action_groups(paths: list[Path]) -> list[tuple[str, list[Path]]]:
 	return action_groups
 
 
+def prepare_crops(
+	paths: list[Path],
+	cropper: YoloPersonCropper,
+	scale_label: str,
+) -> dict[Path, CropResult]:
+	crops: dict[Path, CropResult] = {}
+	for path in paths:
+		crops[path] = cropper.crop_person(path, scale_label)
+		status = crops[path]
+		print(
+			f"[yolo] {path.name}: {status.note}, detection {status.detection_latency:.2f}s",
+			flush=True,
+		)
+	return crops
+
+
 async def process_action(
 	client: OpenAI,
 	paths: list[Path],
 	interval: float,
 	starting_index: int,
+	cropper: YoloPersonCropper,
+	scale_label: str,
 ) -> tuple[list[Result], list[float], int]:
 	if not paths:
 		return [], [], starting_index
@@ -368,6 +499,7 @@ async def process_action(
 	completion_data: dict[Path, Result] = {}
 	started = False
 	received_counter = starting_index
+	crop_map = prepare_crops(paths, cropper, scale_label)
 
 	def on_done(task: asyncio.Task, *, path: Path, send_index: int) -> None:
 		nonlocal received_counter
@@ -377,20 +509,27 @@ async def process_action(
 			truth = expected_label(path)
 			frame = frame_index(path)
 			received_counter += 1
+			detection_latency = crop_map[path].detection_latency
+			cropped_path = crop_map[path].image_path
+			total_latency = detection_latency + latency
 			result = Result(
 				path=path,
+				cropped_path=cropped_path,
 				frame=frame,
 				true=truth,
 				predicted=pred,
 				reason=reason,
 				raw=raw,
-				latency=latency,
+				latency=total_latency,
 				received_order=received_counter,
+				detection_latency=detection_latency,
+				gpt_latency=latency,
 			)
 			completion_data[path] = result
 			print(
 				f"[sent {send_index} | recv {received_counter}] {path} -> truth {truth}, "
-				f"predicted {pred}, correct {result.correct}, latency {latency:.2f}s",
+				f"predicted {pred}, correct {result.correct}, "
+				f"latency = YOLO {detection_latency:.2f}s + GPT {latency:.2f}s = {total_latency:.2f}s",
 				flush=True,
 			)
 		except Exception as e:
@@ -399,7 +538,36 @@ async def process_action(
 	for idx, path in enumerate(paths):
 		send_index = starting_index + idx + 1
 		send_order[path] = send_index
-		t = asyncio.create_task(request_single(client, path))
+		crop_info = crop_map[path]
+		if crop_info.skip_gpt:
+			truth = expected_label(path)
+			frame = frame_index(path)
+			received_counter += 1
+			total_latency = crop_info.detection_latency
+			result = Result(
+				path=path,
+				cropped_path=crop_info.image_path,
+				frame=frame,
+				true=truth,
+				predicted=0,
+				reason="No person detected by YOLO; skipping GPT and labeling as non-malicious (0).",
+				raw=crop_info.note,
+				latency=total_latency,
+				received_order=received_counter,
+				detection_latency=crop_info.detection_latency,
+				gpt_latency=0.0,
+			)
+			completion_data[path] = result
+			print(
+				f"[sent {send_index} | recv {received_counter}] {path} -> truth {truth}, "
+				f"predicted 0 (YOLO no-person), correct {result.correct}, "
+				f"latency = YOLO {crop_info.detection_latency:.2f}s + GPT 0.00s = {total_latency:.2f}s",
+				flush=True,
+			)
+			continue
+
+		cropped_path = crop_info.image_path
+		t = asyncio.create_task(request_single(client, cropped_path))
 		t.add_done_callback(lambda task, p=path, s=send_index: on_done(task, path=p, send_index=s))
 		tasks.append(t)
 		if not started:
@@ -421,6 +589,8 @@ async def process_scale_actions(
 	client: OpenAI,
 	action_groups: list[tuple[str, list[Path]]],
 	interval: float,
+	cropper: YoloPersonCropper,
+	scale_label: str,
 ) -> tuple[list[Result], dict[str, list[float]]]:
 	all_results: list[Result] = []
 	latency_map: dict[str, list[float]] = {}
@@ -431,6 +601,8 @@ async def process_scale_actions(
 			paths,
 			interval,
 			received_index,
+			cropper,
+			scale_label,
 		)
 		all_results.extend(results)
 		latency_map[trial_id] = latencies
@@ -548,6 +720,7 @@ def save_results(results: list[Result], path: Path) -> None:
 	serialised = [
 		{
 			"image_path": str(r.path),
+			"cropped_image_path": str(r.cropped_path),
 			"frame_index": r.frame,
 			"true_label": r.true,
 			"predicted_label": r.predicted,
@@ -555,6 +728,8 @@ def save_results(results: list[Result], path: Path) -> None:
 			"raw_response": r.raw,
 			"correct": r.correct,
 			"response_time_seconds": r.latency,
+			"detection_time_seconds": r.detection_latency,
+			"gpt_time_seconds": r.gpt_latency,
 			"response_order": r.received_order,
 			"hmm_probability_malicious": r.hmm_prob,
 			"hmm_filtered_label": r.hmm_label,
@@ -688,7 +863,7 @@ def save_hmm_heatmaps(results: list[Result], output_dir: Path) -> list[Path]:
 	return saved_paths
 
 
-def save_latency_plot(latencies: list[float], path: Path, title: str = "OpenAI response times") -> None:
+def save_latency_plot(latencies: list[float], path: Path, title: str = "YOLO+GPT response times") -> None:
 	if not latencies:
 		return
 	path.parent.mkdir(parents=True, exist_ok=True)
@@ -721,7 +896,7 @@ def save_combined_latency_plot(latency_map: dict[str, list[float]], path: Path) 
 		plt.plot(indices, latencies, marker="o", label=label)
 	plt.xlabel("Request index")
 	plt.ylabel("Response time (s)")
-	plt.title("Response times (all scales)")
+	plt.title("YOLO+GPT response times (all scales)")
 	plt.grid(False)
 	ax = plt.gca()
 	all_latencies = [value for latencies in valid.values() for value in latencies]
@@ -740,12 +915,16 @@ def main() -> None:
 	reset_output_dir(OUTPUT_DIR)
 	ensure_trimmed_images(args.image_root, args.trimmed_root)
 	client = build_client()
+	cropper = YoloPersonCropper(args.yolo_model, CROP_OUTPUT_DIR, confidence=args.yolo_confidence)
+	model_msg = f"Using YOLO model '{args.yolo_model}' (small/fast for person detection) with confidence {args.yolo_confidence:.2f}."
+	print(model_msg)
 	base_results = OUTPUT_DIR / args.output_json.name
 	base_frame_plot = OUTPUT_DIR / args.frame_plot.name
 	base_latency_plot = OUTPUT_DIR / args.latency_plot.name
 	report_path = OUTPUT_DIR / "summary.txt"
 	report_lines: list[str] = []
 	combined_latencies: dict[str, list[float]] = {}
+	report_lines.append(model_msg)
 
 	for scale, label, suffix in SCALE_CONFIGS:
 		scaled_root = ensure_scaled_images(args.trimmed_root, scale, label)
@@ -755,8 +934,19 @@ def main() -> None:
 		action_groups = build_action_groups(paths)
 		print(f"\n=== Evaluation for {label} (scale ×{scale:.3f}) ===")
 		report_lines.append(f"=== Evaluation for {label} (scale ×{scale:.3f}) ===")
+		latency_formula = "Latency per request = YOLO detection/cropping time + GPT response time."
+		print(latency_formula)
+		report_lines.append(latency_formula)
 		interval = max(REQUEST_INTERVAL, args.pause)
-		results, latency_map = asyncio.run(process_scale_actions(client, action_groups, interval))
+		results, latency_map = asyncio.run(
+			process_scale_actions(
+				client,
+				action_groups,
+				interval,
+				cropper,
+				label,
+			)
+		)
 		apply_hmm_filter(results)
 		overall, per_label, frame_accuracy, frame_label_accuracy = summarise(results)
 		hmm_overall, hmm_per_label, hmm_frame_accuracy, hmm_frame_label_accuracy = summarise_hmm(results)
@@ -805,11 +995,18 @@ def main() -> None:
 				report_lines.append(lbl_line)
 
 		latencies = [lat for lat_list in latency_map.values() for lat in lat_list]
+		detection_latencies = [r.detection_latency for r in results]
+		gpt_latencies = [r.gpt_latency for r in results]
 		if latencies:
 			average_latency = statistics.mean(latencies)
-			latency_line = f"Average response time: {average_latency:.2f}s over {len(latencies)} requests"
+			average_detection = statistics.mean(detection_latencies)
+			average_gpt = statistics.mean(gpt_latencies)
+			latency_line = (
+				f"Average latency: YOLO {average_detection:.2f}s + GPT {average_gpt:.2f}s "
+				f"= {average_latency:.2f}s over {len(latencies)} requests"
+			)
 		else:
-			latency_line = "Average response time: n/a (no results)"
+			latency_line = "Average latency: n/a (no results)"
 		print(latency_line)
 		report_lines.append(latency_line)
 		combined_latencies[label] = latencies
@@ -825,7 +1022,7 @@ def main() -> None:
 		save_frame_plot(frame_accuracy, frame_label_accuracy, frame_plot_path)
 		hmm_frame_plot_generated = bool(hmm_frame_accuracy)
 		save_frame_plot(hmm_frame_accuracy, hmm_frame_label_accuracy, hmm_frame_plot_path)
-		save_latency_plot(latencies, latency_plot_path, title=f"Response times ({label})")
+		save_latency_plot(latencies, latency_plot_path, title=f"YOLO+GPT response times ({label})")
 		heatmap_paths = save_label_heatmaps(results, heatmap_dir)
 		hmm_heatmap_paths = save_hmm_heatmaps(results, hmm_heatmap_dir)
 
