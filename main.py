@@ -24,7 +24,7 @@ from matplotlib.ticker import MaxNLocator
 import numpy as np
 from PIL import Image
 from dotenv import load_dotenv
-from openai import OpenAI
+import requests
 
 try:
 	from ultralytics import YOLO
@@ -158,12 +158,11 @@ def parse_args() -> argparse.Namespace:
 	return parser.parse_args()
 
 
-def build_client() -> OpenAI:
+def build_client() -> str:
 	load_dotenv()
-	api_key = os.getenv("OPENAI_API_KEY")
-	if not api_key:
-		raise EnvironmentError("OPENAI_API_KEY is missing. Check your .env file.")
-	return OpenAI(api_key=api_key)
+	# ローカルVLMエンドポイントを使用（Ollama既定ポート 11434）
+	base_url = os.getenv("LOCAL_VLM_URL", "http://10.229.40.52:11434/api")
+	return base_url.rstrip("/")
 
 
 def list_images(root: Path) -> list[Path]:
@@ -398,32 +397,41 @@ def frame_index(path: Path) -> int:
 		raise ValueError(f"Cannot parse frame index from {path.name}") from error
 
 
-def to_data_url(path: Path) -> str:
+def to_base64(path: Path) -> str:
 	with path.open("rb") as handle:
-		payload = base64.b64encode(handle.read()).decode("ascii")
-	return f"data:image/png;base64,{payload}"
+		return base64.b64encode(handle.read()).decode("ascii")
 
 
-def call_gpt(client: OpenAI, image_path: Path, meta_text: Optional[str] = None) -> str:
-	image_data = to_data_url(image_path)
-	contents: list[dict] = [{"type": "input_text", "text": PROMPT_TEXT}]
-	if meta_text:
-		contents.append({"type": "input_text", "text": f"HINT: {meta_text}"})
-	contents.append({"type": "input_image", "image_url": image_data})
-	response = client.responses.create(
-		model="gpt-4o",
-		input=[{"role": "user", "content": contents}],
-		max_output_tokens=200,
-	)
-	return response.output_text.strip()
+def call_gpt(client_base_url: str, image_path: Path, meta_text: Optional[str] = None) -> str:
+	"""Ollama `/api/generate` で画像付きプロンプトを送信（imagesはbase64）。
+
+	期待レスポンス例: {"response": "..."}
+	"""
+	image_b64 = to_base64(image_path)
+	prompt = PROMPT_TEXT if not meta_text else f"{PROMPT_TEXT}\n\nHINT: {meta_text}"
+	payload = {
+		"model": "llava:13b",
+		"prompt": prompt,
+		"images": [image_b64],
+		"stream": False,
+	}
+	url = f"{client_base_url}/generate"
+	resp = requests.post(url, json=payload, timeout=180)
+	resp.raise_for_status()
+	data = resp.json()
+	# Ollama generate: { response: "..." }
+	text = data.get("response") if isinstance(data, dict) else None
+	if isinstance(text, str):
+		return text.strip()
+	raise RuntimeError(f"Unexpected VLM response format: {data}")
 
 
-def safe_predict(client: OpenAI, image_path: Path, meta_text: Optional[str] = None, retries: int = 4) -> tuple[str, float]:
+def safe_predict(client_base_url: str, image_path: Path, meta_text: Optional[str] = None, retries: int = 4) -> tuple[str, float]:
 	delay = 2.0
 	start = time.perf_counter()
 	for attempt in range(1, retries + 1):
 		try:
-			response = call_gpt(client, image_path, meta_text)
+			response = call_gpt(client_base_url, image_path, meta_text)
 			elapsed = time.perf_counter() - start
 			return response, elapsed
 		except Exception as error:  # noqa: BLE001
@@ -453,7 +461,7 @@ def parse_response(raw: str) -> tuple[Optional[int], Optional[str]]:
 
 
 async def request_single(
-	client: OpenAI,
+	client_base_url: str,
 	path: Path,
 	cropper: YoloPersonCropper,
 	scale_label: str,
@@ -477,7 +485,7 @@ async def request_single(
 		else:
 			band = "front_band(±45deg)" if crop.in_front_band else "side_band"
 			meta = f"person_position={band}, center_x_norm={crop.center_x_norm:.3f} (0..1; 0.5 is forward)"
-		raw, gpt_latency = safe_predict(client, crop.image_path, meta)
+		raw, gpt_latency = safe_predict(client_base_url, crop.image_path, meta)
 		return (
 			path,
 			raw,
@@ -526,7 +534,7 @@ def prepare_crops(
 
 
 async def process_action(
-	client: OpenAI,
+	client_base_url: str,
 	paths: list[Path],
 	interval: float,
 	starting_index: int,
@@ -571,7 +579,7 @@ async def process_action(
 			print(
 				f"[sent {send_index} | recv {received_counter}] {path} -> truth {truth}, "
 				f"predicted {result.predicted}, correct {result.correct}, "
-				f"latency = YOLO {detection_latency:.2f}s + GPT {gpt_latency:.2f}s = {total_latency:.2f}s",
+				f"latency = YOLO {detection_latency:.2f}s + VLM {gpt_latency:.2f}s = {total_latency:.2f}s",
 				flush=True,
 			)
 		except Exception as e:
@@ -580,7 +588,7 @@ async def process_action(
 	for idx, path in enumerate(paths):
 		send_index = starting_index + idx + 1
 		send_order[path] = send_index
-		t = asyncio.create_task(request_single(client, path, cropper, scale_label))
+		t = asyncio.create_task(request_single(client_base_url, path, cropper, scale_label))
 		t.add_done_callback(lambda task, p=path, s=send_index: on_done(task, path=p, send_index=s))
 		tasks.append(t)
 		if not started:
@@ -599,7 +607,7 @@ async def process_action(
 
 
 async def process_scale_actions(
-	client: OpenAI,
+	client_base_url: str,
 	action_groups: list[tuple[str, list[Path]]],
 	interval: float,
 	cropper: YoloPersonCropper,
@@ -610,7 +618,7 @@ async def process_scale_actions(
 	received_index = 0
 	for trial_id, paths in action_groups:
 		results, latencies, received_index = await process_action(
-			client,
+			client_base_url,
 			paths,
 			interval,
 			received_index,
@@ -878,7 +886,7 @@ def save_hmm_heatmaps(results: list[Result], output_dir: Path) -> list[Path]:
 	return saved_paths
 
 
-def save_latency_plot(latencies: list[float], path: Path, title: str = "YOLO+GPT response times") -> None:
+def save_latency_plot(latencies: list[float], path: Path, title: str = "YOLO+VLM response times") -> None:
 	if not latencies:
 		return
 	path.parent.mkdir(parents=True, exist_ok=True)
@@ -911,7 +919,7 @@ def save_combined_latency_plot(latency_map: dict[str, list[float]], path: Path) 
 		plt.plot(indices, latencies, marker="o", label=label)
 	plt.xlabel("Request index")
 	plt.ylabel("Response time (s)")
-	plt.title("YOLO+GPT response times (all scales)")
+	plt.title("YOLO+VLM response times (all scales)")
 	plt.grid(False)
 	ax = plt.gca()
 	all_latencies = [value for latencies in valid.values() for value in latencies]
@@ -929,7 +937,7 @@ def main() -> None:
 	args = parse_args()
 	reset_output_dir(OUTPUT_DIR)
 	ensure_trimmed_images(args.image_root, args.trimmed_root)
-	client = build_client()
+	client_base_url = build_client()
 	cropper = YoloPersonCropper(args.yolo_model, CROP_OUTPUT_DIR, confidence=args.yolo_confidence)
 	model_msg = f"Using YOLO model '{args.yolo_model}' (small/fast for person detection) with confidence {args.yolo_confidence:.2f}."
 	print(model_msg)
@@ -949,13 +957,13 @@ def main() -> None:
 		action_groups = build_action_groups(paths)
 		print(f"\n=== Evaluation for {label} (scale ×{scale:.3f}) ===")
 		report_lines.append(f"=== Evaluation for {label} (scale ×{scale:.3f}) ===")
-		latency_formula = "Latency per request = YOLO detection/cropping time + GPT response time."
+		latency_formula = "Latency per request = YOLO detection/cropping time + VLM response time."
 		print(latency_formula)
 		report_lines.append(latency_formula)
 		interval = max(REQUEST_INTERVAL, args.pause)
 		results, latency_map = asyncio.run(
 			process_scale_actions(
-				client,
+				client_base_url,
 				action_groups,
 				interval,
 				cropper,
@@ -1017,7 +1025,7 @@ def main() -> None:
 			average_detection = statistics.mean(detection_latencies)
 			average_gpt = statistics.mean(gpt_latencies)
 			latency_line = (
-				f"Average latency: YOLO {average_detection:.2f}s + GPT {average_gpt:.2f}s "
+				f"Average latency: YOLO {average_detection:.2f}s + VLM {average_gpt:.2f}s "
 				f"= {average_latency:.2f}s over {len(latencies)} requests"
 			)
 		else:
@@ -1037,7 +1045,7 @@ def main() -> None:
 		save_frame_plot(frame_accuracy, frame_label_accuracy, frame_plot_path)
 		hmm_frame_plot_generated = bool(hmm_frame_accuracy)
 		save_frame_plot(hmm_frame_accuracy, hmm_frame_label_accuracy, hmm_frame_plot_path)
-		save_latency_plot(latencies, latency_plot_path, title=f"YOLO+GPT response times ({label})")
+		save_latency_plot(latencies, latency_plot_path, title=f"YOLO+VLM response times ({label})")
 		heatmap_paths = save_label_heatmaps(results, heatmap_dir)
 		hmm_heatmap_paths = save_hmm_heatmaps(results, hmm_heatmap_dir)
 
