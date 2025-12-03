@@ -132,11 +132,14 @@ def call_gpt(client: OpenAI, image_path: Path) -> str:
 	return response.output_text.strip()
 
 
-def safe_predict(client: OpenAI, image_path: Path, retries: int = 4) -> str:
+def safe_predict(client: OpenAI, image_path: Path, retries: int = 4) -> tuple[str, float]:
 	delay = 2.0
+	start = time.perf_counter()
 	for attempt in range(1, retries + 1):
 		try:
-			return call_gpt(client, image_path)
+			response = call_gpt(client, image_path)
+			elapsed = time.perf_counter() - start
+			return response, elapsed
 		except Exception as error:  # noqa: BLE001
 			if attempt == retries:
 				raise RuntimeError(f"Failed to call GPT for {image_path}") from error
@@ -165,17 +168,23 @@ def parse_response(raw: str) -> tuple[Optional[int], Optional[str]]:
 
 def iterate_results(client: OpenAI, paths: list[Path], pause: float) -> list[Result]:
 	results: list[Result] = []
+	latencies: list[float] = []
 	for idx, path in enumerate(paths, start=1):
 		truth = expected_label(path)
 		frame = frame_index(path)
-		raw = safe_predict(client, path)
+		raw, latency = safe_predict(client, path)
 		pred, reason = parse_response(raw)
 
 		results.append(Result(path=path, frame=frame, true=truth, predicted=pred, reason=reason, raw=raw))
+		latencies.append(latency)
 
-		print(f"[{idx}] {path} -> truth {truth}, predicted {pred}, correct {pred == truth}")
+		print(f"[{idx}] {path} -> truth {truth}, predicted {pred}, correct {pred == truth}, latency {latency:.2f}s")
 		if pause:
 			time.sleep(pause)
+	# 平均時間の出力
+	if latencies:
+		avg = sum(latencies) / len(latencies)
+		print(f"\nAverage response time: {avg:.2f}s over {len(latencies)} requests")
 	return results
 
 
