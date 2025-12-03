@@ -17,6 +17,8 @@ from typing import Optional
 import statistics
 import shutil
 
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.ticker import MaxNLocator
 import numpy as np
@@ -103,6 +105,8 @@ class Result:
 	hmm_label: Optional[int] = None
 	detection_latency: float = 0.0
 	gpt_latency: float = 0.0
+	center_x_norm: Optional[float] = None
+	in_front_band: Optional[bool] = None
 
 	@property
 	def correct(self) -> bool:
@@ -116,8 +120,8 @@ class CropResult:
 	note: str
 	has_person: bool
 	skip_gpt: bool
-	has_person: bool
-	skip_gpt: bool
+	center_x_norm: Optional[float] = None
+	in_front_band: Optional[bool] = None
 
 
 def parse_args() -> argparse.Namespace:
@@ -318,6 +322,8 @@ class YoloPersonCropper:
 					"no person detected; using original and skipping GPT",
 					has_person=False,
 					skip_gpt=True,
+					center_x_norm=None,
+					in_front_band=None,
 				)
 
 			x1, y1, x2, y2 = best_box
@@ -329,13 +335,19 @@ class YoloPersonCropper:
 			)
 			cropped = image.crop(crop_box)
 			cropped.save(target_path)
+			# 横方向の中心位置 (0..1)、0.5 が真正面
+			cx = (x1 + x2) / 2.0
+			center_x_norm = float(cx / float(image.width)) if image.width else None
+			in_front = (center_x_norm is not None) and (0.25 <= center_x_norm <= 0.75)
 		detection_latency = time.perf_counter() - start
 		return CropResult(
 			target_path,
 			detection_latency,
 			"cropped largest person",
 			has_person=True,
-			skip_gpt=False,
+				skip_gpt=False,
+				center_x_norm=center_x_norm,
+				in_front_band=in_front,
 		)
 
 
@@ -392,30 +404,26 @@ def to_data_url(path: Path) -> str:
 	return f"data:image/png;base64,{payload}"
 
 
-def call_gpt(client: OpenAI, image_path: Path) -> str:
+def call_gpt(client: OpenAI, image_path: Path, meta_text: Optional[str] = None) -> str:
 	image_data = to_data_url(image_path)
+	contents: list[dict] = [{"type": "input_text", "text": PROMPT_TEXT}]
+	if meta_text:
+		contents.append({"type": "input_text", "text": f"HINT: {meta_text}"})
+	contents.append({"type": "input_image", "image_url": image_data})
 	response = client.responses.create(
 		model="gpt-4o",
-		input=[
-			{
-				"role": "user",
-				"content": [
-					{"type": "input_text", "text": PROMPT_TEXT},
-					{"type": "input_image", "image_url": image_data},
-				],
-			}
-		],
+		input=[{"role": "user", "content": contents}],
 		max_output_tokens=200,
 	)
 	return response.output_text.strip()
 
 
-def safe_predict(client: OpenAI, image_path: Path, retries: int = 4) -> tuple[str, float]:
+def safe_predict(client: OpenAI, image_path: Path, meta_text: Optional[str] = None, retries: int = 4) -> tuple[str, float]:
 	delay = 2.0
 	start = time.perf_counter()
 	for attempt in range(1, retries + 1):
 		try:
-			response = call_gpt(client, image_path)
+			response = call_gpt(client, image_path, meta_text)
 			elapsed = time.perf_counter() - start
 			return response, elapsed
 		except Exception as error:  # noqa: BLE001
@@ -444,9 +452,44 @@ def parse_response(raw: str) -> tuple[Optional[int], Optional[str]]:
 	return None, reason if isinstance(reason, str) else None
 
 
-async def request_single(client: OpenAI, path: Path) -> tuple[Path, str, float]:
-	raw, latency = await asyncio.to_thread(safe_predict, client, path)
-	return path, raw, latency
+async def request_single(
+	client: OpenAI,
+	path: Path,
+	cropper: YoloPersonCropper,
+	scale_label: str,
+) -> tuple[Path, str, float, float, Path, bool, Optional[float], Optional[bool]]:
+	def _run() -> tuple[Path, str, float, float, Path, bool, Optional[float], Optional[bool]]:
+		crop = cropper.crop_person(path, scale_label)
+		if crop.skip_gpt:
+			return (
+				path,
+				crop.note,
+				0.0,
+				crop.detection_latency,
+				crop.image_path,
+				True,
+				crop.center_x_norm,
+				crop.in_front_band,
+			)
+		# Build hint for GPT
+		if crop.center_x_norm is None:
+			meta = "person_position=unknown"
+		else:
+			band = "front_band(±45deg)" if crop.in_front_band else "side_band"
+			meta = f"person_position={band}, center_x_norm={crop.center_x_norm:.3f} (0..1; 0.5 is forward)"
+		raw, gpt_latency = safe_predict(client, crop.image_path, meta)
+		return (
+			path,
+			raw,
+			gpt_latency,
+			crop.detection_latency,
+			crop.image_path,
+			False,
+			crop.center_x_norm,
+			crop.in_front_band,
+		)
+
+	return await asyncio.to_thread(_run)
 
 
 def sort_paths_by_frame(paths: list[Path]) -> list[Path]:
@@ -499,37 +542,36 @@ async def process_action(
 	completion_data: dict[Path, Result] = {}
 	started = False
 	received_counter = starting_index
-	crop_map = prepare_crops(paths, cropper, scale_label)
 
 	def on_done(task: asyncio.Task, *, path: Path, send_index: int) -> None:
 		nonlocal received_counter
 		try:
-			_path, raw, latency = task.result()
+			_path, raw, gpt_latency, detection_latency, cropped_path, skipped, cx_norm, in_front = task.result()
 			pred, reason = parse_response(raw)
 			truth = expected_label(path)
 			frame = frame_index(path)
 			received_counter += 1
-			detection_latency = crop_map[path].detection_latency
-			cropped_path = crop_map[path].image_path
-			total_latency = detection_latency + latency
+			total_latency = detection_latency + gpt_latency
 			result = Result(
 				path=path,
 				cropped_path=cropped_path,
 				frame=frame,
 				true=truth,
-				predicted=pred,
-				reason=reason,
+				predicted=(0 if skipped else pred),
+				reason=("No person detected by YOLO; skipping GPT and labeling as non-malicious (0)." if skipped else reason),
 				raw=raw,
 				latency=total_latency,
 				received_order=received_counter,
 				detection_latency=detection_latency,
-				gpt_latency=latency,
+				gpt_latency=gpt_latency,
+				center_x_norm=cx_norm,
+				in_front_band=in_front,
 			)
 			completion_data[path] = result
 			print(
 				f"[sent {send_index} | recv {received_counter}] {path} -> truth {truth}, "
-				f"predicted {pred}, correct {result.correct}, "
-				f"latency = YOLO {detection_latency:.2f}s + GPT {latency:.2f}s = {total_latency:.2f}s",
+				f"predicted {result.predicted}, correct {result.correct}, "
+				f"latency = YOLO {detection_latency:.2f}s + GPT {gpt_latency:.2f}s = {total_latency:.2f}s",
 				flush=True,
 			)
 		except Exception as e:
@@ -538,36 +580,7 @@ async def process_action(
 	for idx, path in enumerate(paths):
 		send_index = starting_index + idx + 1
 		send_order[path] = send_index
-		crop_info = crop_map[path]
-		if crop_info.skip_gpt:
-			truth = expected_label(path)
-			frame = frame_index(path)
-			received_counter += 1
-			total_latency = crop_info.detection_latency
-			result = Result(
-				path=path,
-				cropped_path=crop_info.image_path,
-				frame=frame,
-				true=truth,
-				predicted=0,
-				reason="No person detected by YOLO; skipping GPT and labeling as non-malicious (0).",
-				raw=crop_info.note,
-				latency=total_latency,
-				received_order=received_counter,
-				detection_latency=crop_info.detection_latency,
-				gpt_latency=0.0,
-			)
-			completion_data[path] = result
-			print(
-				f"[sent {send_index} | recv {received_counter}] {path} -> truth {truth}, "
-				f"predicted 0 (YOLO no-person), correct {result.correct}, "
-				f"latency = YOLO {crop_info.detection_latency:.2f}s + GPT 0.00s = {total_latency:.2f}s",
-				flush=True,
-			)
-			continue
-
-		cropped_path = crop_info.image_path
-		t = asyncio.create_task(request_single(client, cropped_path))
+		t = asyncio.create_task(request_single(client, path, cropper, scale_label))
 		t.add_done_callback(lambda task, p=path, s=send_index: on_done(task, path=p, send_index=s))
 		tasks.append(t)
 		if not started:
@@ -730,6 +743,8 @@ def save_results(results: list[Result], path: Path) -> None:
 			"response_time_seconds": r.latency,
 			"detection_time_seconds": r.detection_latency,
 			"gpt_time_seconds": r.gpt_latency,
+			"person_center_x_norm": r.center_x_norm,
+			"person_in_front_band": r.in_front_band,
 			"response_order": r.received_order,
 			"hmm_probability_malicious": r.hmm_prob,
 			"hmm_filtered_label": r.hmm_label,
