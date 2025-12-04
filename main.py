@@ -161,7 +161,7 @@ def parse_args() -> argparse.Namespace:
 def build_client() -> str:
 	load_dotenv()
 	# ローカルVLMエンドポイントを使用（Ollama既定ポート 11434）
-	base_url = os.getenv("LOCAL_VLM_URL", "http://10.229.40.52:11434/api")
+	base_url = os.getenv("LOCAL_VLM_URL", "http://10.229.40.52:11435/api")
 	return base_url.rstrip("/")
 
 
@@ -410,7 +410,7 @@ def call_gpt(client_base_url: str, image_path: Path, meta_text: Optional[str] = 
 	image_b64 = to_base64(image_path)
 	prompt = PROMPT_TEXT if not meta_text else f"{PROMPT_TEXT}\n\nHINT: {meta_text}"
 	payload = {
-		"model": "llava:13b",
+		"model": "gemma3:27b",
 		"prompt": prompt,
 		"images": [image_b64],
 		"stream": False,
